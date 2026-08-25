@@ -273,30 +273,38 @@ class MaskedAutoencoderViT(nn.Module):
             batch_size * num_variables, -1, output.shape[-1]
         )
 
+    def prepare_visible_patches(self, x, mask_ratio, noise=None):
+        # 将输入图像映射为 patch embedding sequence。
+        x = self.patch_embed(x)
+        # 为 patch 加入 positional embedding，不使用 cls token 对应的位置。
+        x = x + self.pos_embed[:, 1:, :]
+        # 按统一 mask permutation 取得所有真实可见 patch。
+        return self.random_masking(x, mask_ratio, noise)
+
     # 对 patch 执行 encoder，并返回 latent、mask 和顺序恢复索引。
     def forward_encoder(self, x, mask_ratio, noise=None, variable_adapter=None,
                         batch_size=None, num_variables=None,
-                        residual_router=None):
+                        residual_router=None, variable_correction=None):
         # 输入 x shape 为 [N, C, H, W]，可选 noise shape 为 [N, L]。
         # 返回 latent [N, 1+L_keep, D]、mask [N, L] 和 ids_restore [N, L]。
         # N 是图像 batch size，C/H/W 是 channel/高/宽，L 与 L_keep 是总 patch 数与保留 patch 数。
         # D 是 encoder embedding 维度；启用 variable adapter 时 N=B*V，B/V 是原 batch size/变量数。
         # residual_router 为 None 时执行原始 MAE；非空时按图片步骤 2～11 路由 Block 6～12。
-        # 将输入图像映射为 patch embedding sequence。
-        x = self.patch_embed(x)
-
-        # 为 patch 加入 positional embedding，不使用 cls token 对应的位置。
-        x = x + self.pos_embed[:, 1:, :]
-
-        # 随机移除指定比例的 patch，并记录 mask 及恢复顺序。
-        x, mask, ids_restore = self.random_masking(x, mask_ratio, noise)
+        x, mask, ids_restore = self.prepare_visible_patches(
+            x, mask_ratio, noise
+        )
 
         # 图片步骤 1：Global Token 在 MAE Transformer 前提取并广播真实 patch 的公共成分。
         if variable_adapter is not None:
             # 使用必需的 batch_size=B 和 num_variables=V，将 [N,L_keep,D] reshape 为 [B,V,L_keep,D]。
             x = x.reshape(batch_size, num_variables, x.shape[1], x.shape[2])
-            # Global Token 不参与深度 routing；输入和输出 shape 均为 [B,V,L_keep,D]。
-            x = variable_adapter(x)
+            # 分块模式复用完整变量共同得到的 correction；普通模式保持原 adapter forward。
+            if variable_correction is None:
+                x = variable_adapter(x)
+            else:
+                x = variable_adapter.apply_correction(
+                    x, variable_correction
+                )
             # 重新合并 batch 与 variable 轴，恢复为 [B*V,L_keep,D]。
             x = x.reshape(batch_size * num_variables, x.shape[2], x.shape[3])
 
@@ -505,7 +513,8 @@ class MaskedAutoencoderViT(nn.Module):
 
     # 执行完整 forward，依次经过 encoder、decoder 并返回预测和 mask。
     def forward(self, imgs, mask_ratio=0.75, noise=None, variable_adapter=None,
-                batch_size=None, num_variables=None, residual_router=None):
+                batch_size=None, num_variables=None, residual_router=None,
+                variable_correction=None):
         # 输入 imgs shape 为 [N,C,H,W]，可选 noise shape 为 [N,L]；N/C/H/W 是 batch/channel/高/宽。
         # 启用 variable adapter 时 N=B*V，B/V 分别是原 batch size 和变量数。
         # point 模式返回 (None, pred, mask)，pred [N,L,p**2*C]，mask [N,L]。
@@ -517,7 +526,7 @@ class MaskedAutoencoderViT(nn.Module):
         latent, mask, ids_restore = self.forward_encoder(
             imgs, mask_ratio, noise, variable_adapter, batch_size, num_variables,
             # 仅把 Router 透传给 encoder；Decoder、decoder_norm 和 decoder_pred 保持原 frozen 路径。
-            residual_router
+            residual_router, variable_correction
         )
         # 通过 decoder 将 latent 转换为每个 patch 的 pixel 或 quantile prediction。
         pred = self.forward_decoder(latent, ids_restore)

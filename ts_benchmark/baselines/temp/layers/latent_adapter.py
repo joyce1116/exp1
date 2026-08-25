@@ -5,6 +5,7 @@
 import torch
 # 导入神经网络层模块。
 from torch import nn
+from torch.nn import functional as F
 
 
 # 定义通过单个 latent query 注入全局修正表示的轻量 adapter。
@@ -25,6 +26,9 @@ class VariableAwareLatentAdapter(nn.Module):
 
         # 记录 latent query 数量，供外部检查模型结构。
         self.num_latents = num_latents
+        # 仅在测试阶段收集 Global Token 的 softmax attention 统计。
+        self.statistics_mode = "train"
+        self._test_statistics_batches = []
         # 在降维前对输入 patch embedding 执行 LayerNorm。
         self.patch_norm = nn.LayerNorm(embed_dim)
         # 将 patch embedding 从 E 维 projection 到 D 维 latent space。
@@ -61,46 +65,205 @@ class VariableAwareLatentAdapter(nn.Module):
         nn.init.zeros_(self.patch_up.weight)
         nn.init.zeros_(self.patch_up.bias)
 
+    def _reset_test_statistics(self):
+        self._test_statistics_batches = []
+
+    def set_statistics_mode(self, mode):
+        if mode == "test" and self.statistics_mode != "test":
+            self._reset_test_statistics()
+        self.statistics_mode = mode
+
+    @staticmethod
+    def _normalized_entropy(distribution):
+        support_size = distribution.shape[-1]
+        if support_size <= 1:
+            return torch.ones(
+                distribution.shape[:-1],
+                dtype=distribution.dtype, device=distribution.device
+            )
+        return -(
+            distribution * distribution.clamp_min(1e-12).log()
+        ).sum(dim=-1) / torch.log(
+            distribution.new_tensor(float(support_size))
+        )
+
+    def _record_test_statistics(
+        self, attention_weights, num_variables, num_patches
+    ):
+        with torch.no_grad():
+            # attention_weights: [B, H, Q, P]，Q 为 Global Token 数。
+            weights = attention_weights.detach().float()
+            batch_size, num_heads, num_global_tokens, source_count = (
+                weights.shape
+            )
+            if source_count != num_patches:
+                raise RuntimeError(
+                    "Global Token attention source count does not match "
+                    "the shared-patch layout."
+                )
+
+            # 每个公共 patch 是 C 个变量同位置 patch 的等权平均，因此将真实的
+            # patch attention 按 1/C 展开为各变量的等效贡献，保留原统计格式。
+            weights = weights.unsqueeze(-2).expand(
+                batch_size, num_heads, num_global_tokens,
+                num_variables, num_patches
+            ) / num_variables
+
+            # 保留 sample/head 维的等效分布，再严格按原统计定义聚合。
+            variable_routing = weights.sum(dim=-1).mean(dim=1)
+            patch_routing = weights.sum(dim=-2).mean(dim=1)
+            variable_entropy = self._normalized_entropy(variable_routing)
+            patch_entropy = self._normalized_entropy(patch_routing)
+
+            temporal_profiles = weights / weights.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
+            temporal_sum = temporal_profiles.sum(dim=(0, 1))
+
+            normalized_profiles = temporal_profiles / temporal_profiles.square(
+            ).sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-12)
+            profile_vectors = normalized_profiles.permute(
+                2, 3, 0, 1, 4
+            ).reshape(num_global_tokens, num_variables, -1)
+            cosine_sum = torch.matmul(
+                profile_vectors, profile_vectors.transpose(-1, -2)
+            )
+
+            return {
+                "variable_routing": variable_routing.cpu(),
+                "patch_routing": patch_routing.cpu(),
+                "variable_entropy": variable_entropy.cpu(),
+                "patch_entropy": patch_entropy.cpu(),
+                "temporal_sum": temporal_sum.cpu(),
+                "cosine_sum": cosine_sum.cpu(),
+                "profile_count": batch_size * num_heads,
+            }
+
+    def test_statistics(self):
+        if not self._test_statistics_batches:
+            return None
+
+        batches = self._test_statistics_batches
+        temporal_sum = torch.zeros_like(
+            batches[0]["temporal_sum"], dtype=torch.float64
+        )
+        cosine_sum = torch.zeros_like(
+            batches[0]["cosine_sum"], dtype=torch.float64
+        )
+        profile_count = 0
+        for batch in batches:
+            temporal_sum.add_(batch["temporal_sum"].to(torch.float64))
+            cosine_sum.add_(batch["cosine_sum"].to(torch.float64))
+            profile_count += batch["profile_count"]
+
+        return {
+            "variable_routing": torch.cat([
+                batch["variable_routing"] for batch in batches
+            ], dim=0),
+            "patch_routing": torch.cat([
+                batch["patch_routing"] for batch in batches
+            ], dim=0),
+            "variable_entropy": torch.cat([
+                batch["variable_entropy"] for batch in batches
+            ], dim=0),
+            "patch_entropy": torch.cat([
+                batch["patch_entropy"] for batch in batches
+            ], dim=0),
+            "temporal_profile": temporal_sum / profile_count,
+            "temporal_cosine_similarity": cosine_sum / profile_count,
+        }
+
+    # 将原始 MAE patch representation 映射为第一阶段 Global Attention 的 memory。
+    def project_patch_memory(self, patch_tokens):
+        patches = self.patch_down(self.patch_norm(patch_tokens))
+        return self.patch_memory_norm(patches)
+
+    # 使用已经跨全部变量求平均的公共 patch，只计算一次 Global Token。
+    def global_latent_memory(self, mean_patch_memory, num_variables):
+        batch_size, num_patches, _ = mean_patch_memory.shape
+        latents = self.latent_queries.expand(batch_size, -1, -1)
+        latent_query = self.latent_query_norm(latents)
+        latent_update = self.latent_cross_attention(
+            latent_query,
+            mean_patch_memory,
+            mean_patch_memory,
+            need_weights=False,
+        )[0]
+
+        if self.statistics_mode == "test":
+            # 额外的无梯度调用只取 softmax 后的 per-head 权重；
+            # 上面用于模型输出的 attention 调用及 kernel 保持不变。
+            with torch.no_grad():
+                attention_weights = self.latent_cross_attention(
+                    latent_query,
+                    mean_patch_memory,
+                    mean_patch_memory,
+                    need_weights=True,
+                    average_attn_weights=False,
+                )[1]
+            statistics_batch = self._record_test_statistics(
+                attention_weights, num_variables, num_patches
+            )
+            self._test_statistics_batches.append(statistics_batch)
+
+        return self.latent_memory_norm(latents + latent_update)
+
+    # 单个 Global Token 作为唯一 K/V 时 softmax 恒为 1，只需执行 V 与 output projection。
+    def shared_correction(self, latent_memory):
+        if latent_memory.shape[1] != 1:
+            raise RuntimeError(
+                "Shared correction requires exactly one Global Token."
+            )
+        attention = self.patch_cross_attention
+        if attention.training and attention.dropout != 0:
+            raise RuntimeError(
+                "Single-source attention shortcut requires zero dropout."
+            )
+        if attention.bias_k is not None or attention.bias_v is not None:
+            raise RuntimeError(
+                "Single-source attention shortcut does not support bias_kv."
+            )
+        if attention.add_zero_attn:
+            raise RuntimeError(
+                "Single-source attention shortcut does not support zero attention."
+            )
+
+        embed_dim = attention.embed_dim
+        if attention._qkv_same_embed_dim:
+            value_weight = attention.in_proj_weight[2 * embed_dim:]
+        else:
+            value_weight = attention.v_proj_weight
+        value_bias = (
+            None if attention.in_proj_bias is None
+            else attention.in_proj_bias[2 * embed_dim:]
+        )
+        correction = F.linear(latent_memory, value_weight, value_bias)
+        correction = attention.out_proj(correction)
+        correction = self.patch_up(correction)
+        # 仅保留 [B,1,1,E]，后续依靠 broadcasting 注入当前 variable chunk。
+        return correction.unsqueeze(2)
+
+    def correction_from_mean_memory(self, mean_patch_memory, num_variables):
+        latent_memory = self.global_latent_memory(
+            mean_patch_memory, num_variables
+        )
+        return self.shared_correction(latent_memory)
+
+    @staticmethod
+    def apply_correction(patch_tokens, correction):
+        return patch_tokens + correction
+
     # 聚合所有变量的 patch token，并为每个 patch 注入同一个全局修正表示。
     # shape 约定：B 为 batch size，V 为变量数，P 为可见 patch 数，E 为 embedding 维度。
     # 输入 patch_tokens 与输出 tensor 的 shape 均为 [B, V, P, E]。
     def forward(self, patch_tokens):
         # 从输入 shape [B, V, P, E] 中读取各维度大小。
         batch_size, num_variables, num_patches, embed_dim = patch_tokens.shape
-        # 合并 variable 与 patch 两个轴，得到 [B, V*P, E] 并保留作 residual。
-        original = patch_tokens.reshape(batch_size, -1, embed_dim)
-        # 对 patch token 做 LayerNorm 和降维 projection，得到 [B, V*P, D]。
-        patches = self.patch_down(self.patch_norm(original))
-
-        # 为 batch 中每个样本扩展单个 latent query，默认得到 [B, 1, D]。
-        latents = self.latent_queries.expand(batch_size, -1, -1)
-        # 归一化 patch token，作为第一阶段 cross-attention 的 key 和 value。
-        patch_memory = self.patch_memory_norm(patches)
-        # 以单个 latent query [B, 1, D] 聚合 patch memory [B, V*P, D]。
-        latent_update = self.latent_cross_attention(
-            self.latent_query_norm(latents),
-            patch_memory,
-            patch_memory,
-            need_weights=False,
-        )[0]
-        # 通过 residual connection 写回 attention update，默认 shape 保持 [B, 1, D]。
-        latents = latents + latent_update
-
-        # 归一化 latent representation，作为第二阶段 attention 的 key 和 value。
-        latent_memory = self.latent_memory_norm(latents)
-        # 让每个 patch query [B, V*P, D] 读取同一个全局 latent memory [B, 1, D]。
-        patch_update = self.patch_cross_attention(
-            self.patch_query_norm(patches),
-            latent_memory,
-            latent_memory,
-            need_weights=False,
-        )[0]
-        # 将 patch update 从 [B, V*P, D] projection 为 [B, V*P, E]。
-        patch_update = self.patch_up(patch_update)
-
-        # 通过 residual connection 将全局修正表示加回原始 patch embedding。
-        output = original + patch_update
-        # 恢复四维布局，并返回 shape 为 [B, V, P, E] 的 tensor。
-        return output.reshape(
-            batch_size, num_variables, num_patches, embed_dim
+        # 归一化后恢复变量维，并对同一 patch 位置的所有变量直接求平均。
+        # 公共 patch memory 仅供 Global Token 第一阶段 attention 的 K/V 使用。
+        patch_memory = self.project_patch_memory(patch_tokens).mean(dim=1)
+        correction = self.correction_from_mean_memory(
+            patch_memory, num_variables
         )
+        # 不显式复制 correction；由加法自动 broadcast 到全部变量和 patch。
+        return self.apply_correction(patch_tokens, correction)
