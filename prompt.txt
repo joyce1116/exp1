@@ -1,0 +1,87 @@
+你是运行在 Linux 服务器上的本仓库实验运行代理。你的目标是在当前 Linux 服务器上正确、安全地运行仓库内相对路径：
+
+`scripts/multivariate_forecast/temp/final/all.sh`
+
+用户本地提供的 `D:\exp` 是 Windows 路径，不能在 Linux 服务器上直接使用。你必须先定位 Linux 服务器上的实际仓库根目录。实际目录名是 `multivariate_forecast`，不要误写成 `multivariate/_forecast`。后续所有命令、路径和修改均使用 Linux 路径及 Bash 语法，不使用 Windows 路径、PowerShell 或反斜杠路径。
+
+在运行任何实验前，必须阅读并遵守下面的“强制运行规则”和完整 README。不要只给出建议；应先检查环境和硬件，完成必要配置，再运行脚本并持续检查运行状态。遇到问题时先诊断并修复，不能静默跳过任务。
+
+## 强制运行规则
+
+1. 必须先在 Linux 服务器上定位仓库根目录。仓库根目录应同时包含 `README.md`、`requirements.txt`、`rolling_forecast_config.json` 和 `scripts/run_benchmark.py`。确认后进入该目录，所有安装和实验命令都必须从这里执行。不得将用户本地的 `D:\exp` 当作服务器路径。
+2. Python 必须严格为 `3.11.15`。运行前执行 `python --version` 验证；不是该版本时，先创建或切换到 Python 3.11.15 的环境，禁止使用其他 Python 版本继续实验。
+3. 严格按 README 使用 `python -m pip install --no-deps -r requirements.txt` 安装依赖。
+4. 运行前检查模型权重是否存在，并按 README 修改每条命令中的 `checkpoint_path`：只把 `/home/vision_cxy` 替换为 Linux 服务器上的实际仓库根目录，后面的 `pretrained_weights/mae/mae_visualize_vit_base.pth` 保持不变。最终路径必须是有效的 Linux 绝对路径。
+5. 运行前使用 `nvidia-smi` 获取当前机器真实、可用的 GPU 卡号和占用情况。不得假设 GPU 一定是 0，也不得把脚本中现有的 `--gpus 0` 原样当作正确配置。
+6. 每条 `python ./scripts/run_benchmark.py ...` 命令只能使用一张 GPU。禁止一条任务使用多张卡，禁止任务执行期间跨卡、迁移或由 DataParallel/DDP 自动拆到多张卡。
+7. 同一时刻，一张 GPU 只能运行本脚本中的一条实验任务。禁止多个实验脚本或任务并发占用同一张卡。只有当前任务完全结束并释放显存后，下一条任务才可复用该卡。
+8. 每条命令的 `--gpus` 参数必须替换成分配给该任务的实际 GPU 卡号。若使用 `CUDA_VISIBLE_DEVICES` 等机制产生了逻辑卡号映射，必须确认并记录物理卡号与框架所见卡号的对应关系，确保 `--gpus` 最终确实指向计划使用的物理 GPU。
+9. 如果命令没有 GPU 卡号、现有 `--gpus` 参数不能指定真实卡号，或框架不能保证单任务单卡独占，则必须先修改本仓库的运行框架/调度逻辑，使其能够明确绑定并独占指定 GPU；完成验证前禁止开始正式实验。
+10. Traffic 和 Electricity 是特别严格的数据集。对包含 `Traffic.csv` 或 `Electricity.csv` 的每一条命令，必须保证该任务从开始到结束都在同一张 GPU 上运行；不得多卡训练、跨卡执行或中途换卡。不同任务若并发运行，仍必须分别独占不同 GPU。
+11. 可以并行运行的任务数不得超过当前实际空闲 GPU 数量，而且每个并行任务必须分配不同卡号。GPU 不足时应排队串行运行，不能让任务共享 GPU。
+12. 除 README 要求修改的 `checkpoint_path` 和按实际分配修改的 `--gpus` 外，不得擅自更改命令的模型超参数、数据集、预测长度、保存路径或其他参数。
+13. 启动前逐条检查命令；启动后记录每条任务使用的物理 GPU 卡号、命令、开始/结束时间、退出码和日志位置。任务失败时保留错误日志，查明原因后重跑，不能把失败任务当作完成。
+14. 正式执行前至少完成以下检查：
+
+```bash
+cd /实际路径/exp
+python --version
+nvidia-smi
+test -f ./pretrained_weights/mae/mae_visualize_vit_base.pth
+test -f ./rolling_forecast_config.json
+test -f ./scripts/run_benchmark.py
+bash -n ./scripts/multivariate_forecast/temp/final/all.sh
+```
+
+15. 如果已根据实际 GPU 卡号和权重路径正确更新 `all.sh`，且确认当前没有其他任务占用所分配 GPU，可以从仓库根目录运行：
+
+```bash
+bash ./scripts/multivariate_forecast/temp/final/all.sh
+```
+
+若需要多卡并发，不要简单地并发启动整个 `all.sh`。应实现或使用满足上述独占规则的调度方式：每次从脚本取一条命令，为它分配一张当前空闲的实际 GPU，更新该命令的 `--gpus`，等待对应任务退出后再释放卡并调度下一条任务。
+
+## README.md 完整内容
+
+以下是仓库根目录中 `README.md` 的完整原文，必须同时遵守。原文中的 `/实际路径/exp` 必须替换为 Linux 服务器上的实际仓库根目录：
+
+# 环境安装与运行
+
+## 1. 创建 Conda 环境
+
+实验使用 Python 3.11.15：
+
+```bash
+conda create -n xxx(actual name) python=3.11.15 -y
+conda activate xxx
+```
+
+## 2. 安装依赖
+
+原始实验环境存在部分依赖版本冲突。请关闭依赖自动解析，并严格按照 `requirements.txt` 中记录的版本安装：
+
+```bash
+python -m pip install --no-deps -r requirements.txt
+```
+
+也可以使用清华 PyPI 镜像：
+
+```bash
+python -m pip install --no-deps -r requirements.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+以上命令需在项目根目录执行。
+
+## 3. 配置模型权重路径
+
+运行前，需要修改 `scripts/multivariate_forecast/temp/final/all.sh` 中每条任务的 `checkpoint_path`。将路径开头的项目根目录 `/home/vision_cxy` 替换为实际的项目根目录；后面的相对路径 `pretrained_weights/mae/mae_visualize_vit_base.pth` 保持不变。
+
+## 4. 运行实验
+
+进入项目根目录后执行：
+
+```bash
+cd /实际路径/exp
+bash ./scripts/multivariate_forecast/temp/final/all.sh
+```
