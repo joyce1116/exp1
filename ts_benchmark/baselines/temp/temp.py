@@ -68,7 +68,7 @@ class VisionTS(DeepForecastingModelBase):
             sort_keys=True, default=str
         )
         self._run_id = hashlib.sha256(fingerprint.encode()).hexdigest()[:32]
-        self._output_dir = None
+        self._summary_dir = None
         self._collect_channel_statistics = False
         self._channel_statistics_horizon = None
         self._channel_statistics_sum = None
@@ -240,8 +240,10 @@ class VisionTS(DeepForecastingModelBase):
         self._best_validation_mse = float("inf")
         self._best_relative_biases = None
         dataset_name = self._dataset_name(train_valid_data, covariates)
-        self._output_dir = (
-            Path(__file__).resolve().parent
+        self._summary_dir = (
+            Path("result")
+            / "Temp"
+            / "summary"
             / dataset_name
             / (
                 f"seqlen{self.config.seq_len}_lr{format(self.config.lr, '.12g')}_"
@@ -271,10 +273,10 @@ class VisionTS(DeepForecastingModelBase):
         return float(value)
 
     def _save_validation_statistics(self, row):
-        if self._output_dir is None:
+        if self._summary_dir is None:
             return
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        path = self._output_dir / (
+        self._summary_dir.mkdir(parents=True, exist_ok=True)
+        path = self._summary_dir / (
             f"horizon{self.config.horizon}_stage3_internal_statistics.csv"
         )
         pd.DataFrame([row]).to_csv(
@@ -295,9 +297,9 @@ class VisionTS(DeepForecastingModelBase):
         )
 
     def _save_best_relative_biases(self):
-        if self._output_dir is None or self._best_relative_biases is None:
+        if self._summary_dir is None or self._best_relative_biases is None:
             return
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._summary_dir.mkdir(parents=True, exist_ok=True)
         temporal_offsets = range(
             -self._core_model().num_patch_input + 1,
             self._core_model().num_patch_input,
@@ -309,14 +311,14 @@ class VisionTS(DeepForecastingModelBase):
                 temporal.numpy(),
                 columns=[str(offset) for offset in temporal_offsets],
             ).to_csv(
-                self._output_dir / f"temporal_relative_bias_{stage}.csv",
+                self._summary_dir / f"temporal_relative_bias_{stage}.csv",
                 index=False,
                 float_format="%.8g",
             )
             pd.DataFrame(
                 periodic.numpy(), columns=[str(offset) for offset in range(14)]
             ).to_csv(
-                self._output_dir / f"periodic_relative_bias_{stage}.csv",
+                self._summary_dir / f"periodic_relative_bias_{stage}.csv",
                 index=False,
                 float_format="%.8g",
             )
@@ -642,81 +644,15 @@ class VisionTS(DeepForecastingModelBase):
         })
 
     def _save_channel_statistics(self):
-        if self._output_dir is None or self._channel_statistics_sum is None:
+        if self._summary_dir is None or self._channel_statistics_sum is None:
             return
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._summary_dir.mkdir(parents=True, exist_ok=True)
         frame = self._channel_statistics_frame()
         prefix = f"horizon{self._channel_statistics_horizon}_channel_module"
         frame.to_csv(
-            self._output_dir / f"{prefix}.csv", index=False,
+            self._summary_dir / f"{prefix}.csv", index=False,
             float_format="%.8g"
         )
-
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        figure, axes = plt.subplots(2, 2, figsize=(14, 9))
-        for column, label in (
-            ("intra_channel_update_ratio", "Intra channel"),
-            ("intra_patch_update_ratio", "Intra patch"),
-            ("inter_channel_update_ratio", "Inter channel"),
-        ):
-            axes[0, 0].plot(
-                frame["round"], frame[column], marker="o", label=label
-            )
-        axes[0, 0].set_title("Relative update by round")
-        axes[0, 0].set_xlabel("Round")
-        axes[0, 0].set_xticks(frame["round"])
-        axes[0, 0].legend()
-
-        axes[0, 1].plot(
-            frame["round"], frame["channel_pair_cosine_before_inter"],
-            marker="o", label="Before inter attention"
-        )
-        axes[0, 1].plot(
-            frame["round"], frame["channel_pair_cosine"], marker="o",
-            label="After inter attention"
-        )
-        axes[0, 1].set_title("Cross-variable channel cosine")
-        axes[0, 1].set_xlabel("Round")
-        axes[0, 1].set_xticks(frame["round"])
-        axes[0, 1].legend()
-
-        axes[1, 0].plot(
-            frame["round"],
-            frame["within_variable_patch_cosine_before_intra"],
-            marker="o", linestyle="--", label="Within before"
-        )
-        axes[1, 0].plot(
-            frame["round"], frame["within_variable_patch_cosine"],
-            marker="o", label="Within after"
-        )
-        axes[1, 0].plot(
-            frame["round"],
-            frame["between_variable_patch_cosine_before_intra"],
-            marker="o", linestyle="--", label="Between before"
-        )
-        axes[1, 0].plot(
-            frame["round"], frame["between_variable_patch_cosine"],
-            marker="o", label="Between after"
-        )
-        axes[1, 0].set_title("Patch-token cosine")
-        axes[1, 0].set_xlabel("Round")
-        axes[1, 0].set_xticks(frame["round"])
-        axes[1, 0].legend()
-
-        final = frame.iloc[-1]
-        axes[1, 1].bar(
-            ["Correction RMS", "Correction / patch RMS"],
-            [final["correction_rms"],
-             final["correction_to_patch_rms_ratio"]]
-        )
-        axes[1, 1].set_title("Final correction strength")
-        axes[1, 1].tick_params(axis="x", rotation=15)
-        figure.tight_layout()
-        figure.savefig(self._output_dir / f"{prefix}.png", dpi=180)
-        plt.close(figure)
 
     def forecast(self, horizon, series, *, covariates=None):
         self._reset_channel_statistics(horizon)

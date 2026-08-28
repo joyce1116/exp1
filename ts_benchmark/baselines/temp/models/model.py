@@ -39,7 +39,7 @@ MAE_ARCH = {
 class VisionTS(nn.Module):
 
     # 分块大小固定为 64；是否启用由外层配置决定，不把大小暴露为超参数。
-    variable_chunk_size = 32
+    variable_chunk_size = 16
 
     # 初始化视觉 backbone、pretrained checkpoint 和 channel-token adapter。
     def __init__(self, arch='mae_base', ckpt_path=None, load_ckpt=True,
