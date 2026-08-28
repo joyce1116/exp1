@@ -1,40 +1,43 @@
-# 说明本模块为 VisionTS patch token 提供全局修正 latent adapter。
-"""Global-correction latent adapter for VisionTS patch tokens."""
+"""Channel-token latent adapter for VisionTS patch tokens."""
 
 # 导入 PyTorch tensor 与参数初始化功能。
 import torch
+import math
 # 导入神经网络层模块。
 from torch import nn
 from torch.nn import functional as F
 
 
-# 定义通过单个 latent query 注入全局修正表示的轻量 adapter。
 class VariableAwareLatentAdapter(nn.Module):
-    # 说明该类以单个 latent query 构成轻量的全局信息瓶颈。
-    """Use one latent query as a lightweight global-correction bottleneck."""
+    """Use channel tokens to exchange information between variables."""
 
     # 创建 projection、双向 cross-attention 和 LayerNorm 等子层。
     def __init__(
         self,
         embed_dim=768,  # 输入 patch token 的 embedding 维度 E。
-        num_latents=1,  # 全局修正 latent query 的数量，默认为 1。
+        num_latents=1,  # 每个变量使用的 channel token 数量。
         latent_dim=192,  # attention 内部 latent space 的维度 D。
         num_heads=4,  # multi-head cross-attention 的 head 数量。
+        channel_depth=1,
     ):
         # 初始化 nn.Module 的内部状态。
         super().__init__()
 
-        # 记录 latent query 数量，供外部检查模型结构。
+        if num_latents != 1:
+            raise ValueError("Channel-token adapter requires num_latents=1.")
+        if not isinstance(channel_depth, int) or isinstance(channel_depth, bool) \
+                or channel_depth < 1:
+            raise ValueError("channel_depth must be a positive integer.")
         self.num_latents = num_latents
-        # 仅在测试阶段收集 Global Token 的 softmax attention 统计。
-        self.statistics_mode = "train"
-        self._test_statistics_batches = []
+        self.channel_depth = channel_depth
+        self.collect_statistics = False
+        self.latest_statistics = None
         # 在降维前对输入 patch embedding 执行 LayerNorm。
         self.patch_norm = nn.LayerNorm(embed_dim)
         # 将 patch embedding 从 E 维 projection 到 D 维 latent space。
         self.patch_down = nn.Linear(embed_dim, latent_dim)
 
-        # 创建可学习且由所有样本共享的全局修正 query，默认 shape 为 [1, 1, D]。
+        # 创建由所有变量共享初值的可学习 channel token。
         self.latent_queries = nn.Parameter(
             torch.zeros(1, num_latents, latent_dim)
         )
@@ -46,6 +49,11 @@ class VariableAwareLatentAdapter(nn.Module):
         self.latent_cross_attention = nn.MultiheadAttention(
             latent_dim, num_heads, batch_first=True
         )
+        self.channel_query_norm = nn.LayerNorm(latent_dim)
+        self.channel_attention = nn.MultiheadAttention(
+            latent_dim, num_heads, batch_first=True
+        )
+        self.channel_memory_norm = nn.LayerNorm(latent_dim)
 
         # 在 patch query 读取 latent representation 前执行 LayerNorm。
         self.patch_query_norm = nn.LayerNorm(latent_dim)
@@ -65,155 +73,131 @@ class VariableAwareLatentAdapter(nn.Module):
         nn.init.zeros_(self.patch_up.weight)
         nn.init.zeros_(self.patch_up.bias)
 
-    def _reset_test_statistics(self):
-        self._test_statistics_batches = []
-
-    def set_statistics_mode(self, mode):
-        if mode == "test" and self.statistics_mode != "test":
-            self._reset_test_statistics()
-        self.statistics_mode = mode
-
-    @staticmethod
-    def _normalized_entropy(distribution):
-        support_size = distribution.shape[-1]
-        if support_size <= 1:
-            return torch.ones(
-                distribution.shape[:-1],
-                dtype=distribution.dtype, device=distribution.device
-            )
-        return -(
-            distribution * distribution.clamp_min(1e-12).log()
-        ).sum(dim=-1) / torch.log(
-            distribution.new_tensor(float(support_size))
-        )
-
-    def _record_test_statistics(
-        self, attention_weights, num_variables, num_patches
-    ):
-        with torch.no_grad():
-            # attention_weights: [B, H, Q, P]，Q 为 Global Token 数。
-            weights = attention_weights.detach().float()
-            batch_size, num_heads, num_global_tokens, source_count = (
-                weights.shape
-            )
-            if source_count != num_patches:
-                raise RuntimeError(
-                    "Global Token attention source count does not match "
-                    "the shared-patch layout."
-                )
-
-            # 每个公共 patch 是 C 个变量同位置 patch 的等权平均，因此将真实的
-            # patch attention 按 1/C 展开为各变量的等效贡献，保留原统计格式。
-            weights = weights.unsqueeze(-2).expand(
-                batch_size, num_heads, num_global_tokens,
-                num_variables, num_patches
-            ) / num_variables
-
-            # 保留 sample/head 维的等效分布，再严格按原统计定义聚合。
-            variable_routing = weights.sum(dim=-1).mean(dim=1)
-            patch_routing = weights.sum(dim=-2).mean(dim=1)
-            variable_entropy = self._normalized_entropy(variable_routing)
-            patch_entropy = self._normalized_entropy(patch_routing)
-
-            temporal_profiles = weights / weights.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-12)
-            temporal_sum = temporal_profiles.sum(dim=(0, 1))
-
-            normalized_profiles = temporal_profiles / temporal_profiles.square(
-            ).sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-12)
-            profile_vectors = normalized_profiles.permute(
-                2, 3, 0, 1, 4
-            ).reshape(num_global_tokens, num_variables, -1)
-            cosine_sum = torch.matmul(
-                profile_vectors, profile_vectors.transpose(-1, -2)
-            )
-
-            return {
-                "variable_routing": variable_routing.cpu(),
-                "patch_routing": patch_routing.cpu(),
-                "variable_entropy": variable_entropy.cpu(),
-                "patch_entropy": patch_entropy.cpu(),
-                "temporal_sum": temporal_sum.cpu(),
-                "cosine_sum": cosine_sum.cpu(),
-                "profile_count": batch_size * num_heads,
-            }
-
-    def test_statistics(self):
-        if not self._test_statistics_batches:
-            return None
-
-        batches = self._test_statistics_batches
-        temporal_sum = torch.zeros_like(
-            batches[0]["temporal_sum"], dtype=torch.float64
-        )
-        cosine_sum = torch.zeros_like(
-            batches[0]["cosine_sum"], dtype=torch.float64
-        )
-        profile_count = 0
-        for batch in batches:
-            temporal_sum.add_(batch["temporal_sum"].to(torch.float64))
-            cosine_sum.add_(batch["cosine_sum"].to(torch.float64))
-            profile_count += batch["profile_count"]
-
-        return {
-            "variable_routing": torch.cat([
-                batch["variable_routing"] for batch in batches
-            ], dim=0),
-            "patch_routing": torch.cat([
-                batch["patch_routing"] for batch in batches
-            ], dim=0),
-            "variable_entropy": torch.cat([
-                batch["variable_entropy"] for batch in batches
-            ], dim=0),
-            "patch_entropy": torch.cat([
-                batch["patch_entropy"] for batch in batches
-            ], dim=0),
-            "temporal_profile": temporal_sum / profile_count,
-            "temporal_cosine_similarity": cosine_sum / profile_count,
-        }
-
-    # 将原始 MAE patch representation 映射为第一阶段 Global Attention 的 memory。
+    # 将原始 MAE patch representation 映射为 channel-token memory。
     def project_patch_memory(self, patch_tokens):
         patches = self.patch_down(self.patch_norm(patch_tokens))
         return self.patch_memory_norm(patches)
 
-    # 使用已经跨全部变量求平均的公共 patch，只计算一次 Global Token。
-    def global_latent_memory(self, mean_patch_memory, num_variables):
-        batch_size, num_patches, _ = mean_patch_memory.shape
-        latents = self.latent_queries.expand(batch_size, -1, -1)
-        latent_query = self.latent_query_norm(latents)
-        latent_update = self.latent_cross_attention(
-            latent_query,
-            mean_patch_memory,
-            mean_patch_memory,
-            need_weights=False,
+    def initial_channel_tokens(self, batch_size, num_variables):
+        return self.latent_queries.expand(batch_size, num_variables, -1)
+
+    def update_variable_tokens(self, patch_memory, channel_tokens):
+        batch_size, num_variables, num_patches, latent_dim = (
+            patch_memory.shape
+        )
+        sequence = torch.cat((
+            channel_tokens.unsqueeze(2), patch_memory
+        ), dim=2).reshape(
+            batch_size * num_variables, num_patches + 1, latent_dim
+        )
+        normalized = self.latent_query_norm(sequence)
+        update = self.latent_cross_attention(
+            normalized, normalized, normalized, need_weights=False
         )[0]
+        sequence = self.latent_memory_norm(sequence + update).reshape(
+            batch_size, num_variables, num_patches + 1, latent_dim
+        )
+        return sequence[:, :, 1:, :], sequence[:, :, 0, :]
 
-        if self.statistics_mode == "test":
-            # 额外的无梯度调用只取 softmax 后的 per-head 权重；
-            # 上面用于模型输出的 attention 调用及 kernel 保持不变。
-            with torch.no_grad():
-                attention_weights = self.latent_cross_attention(
-                    latent_query,
-                    mean_patch_memory,
-                    mean_patch_memory,
-                    need_weights=True,
-                    average_attn_weights=False,
-                )[1]
-            statistics_batch = self._record_test_statistics(
-                attention_weights, num_variables, num_patches
+    def mix_channel_tokens(self, channel_tokens):
+        normalized = self.channel_query_norm(channel_tokens)
+        update = self.channel_attention(
+            normalized, normalized, normalized, need_weights=False
+        )[0]
+        return self.channel_memory_norm(channel_tokens + update)
+
+    @staticmethod
+    def relative_rms(output, input):
+        with torch.no_grad():
+            output = output.detach().float()
+            input = input.detach().float()
+            output_rms = output.square().mean().sqrt()
+            input_rms = input.square().mean().sqrt()
+            return output.sub(input).square().mean().sqrt() / (
+                torch.maximum(input_rms, output_rms) + 1e-12
             )
-            self._test_statistics_batches.append(statistics_batch)
 
-        return self.latent_memory_norm(latents + latent_update)
+    @staticmethod
+    def pair_cosine(tokens):
+        with torch.no_grad():
+            normalized = F.normalize(
+                tokens.detach().float(), dim=-1, eps=1e-12
+            )
+            num_tokens = normalized.shape[-2]
+            if num_tokens == 1:
+                return normalized.new_tensor(1.0)
+            summed = normalized.sum(dim=-2)
+            diagonal = normalized.square().sum(dim=-1).sum(dim=-1)
+            return (
+                (summed.square().sum(dim=-1) - diagonal)
+                / (num_tokens * (num_tokens - 1))
+            ).mean()
 
-    # 单个 Global Token 作为唯一 K/V 时 softmax 恒为 1，只需执行 V 与 output projection。
+    @classmethod
+    def channel_pair_cosine(cls, channel_tokens):
+        return cls.pair_cosine(channel_tokens)
+
+    @classmethod
+    def patch_pair_cosines(cls, patch_tokens):
+        return (
+            cls.pair_cosine(patch_tokens),
+            cls.pair_cosine(patch_tokens.transpose(1, 2)),
+        )
+
+    @staticmethod
+    def pair_cosine_from_sum(token_sum, num_tokens):
+        with torch.no_grad():
+            if num_tokens == 1:
+                return token_sum.new_tensor(1.0)
+            return (
+                (token_sum.square().sum(dim=-1) - num_tokens)
+                / (num_tokens * (num_tokens - 1))
+            ).mean()
+
+    def round_statistics(
+        self, channel_input, channel_local, channel_mixed,
+        patch_input=None, patch_output=None, patch_ratio=None,
+        patch_input_cosines=None, patch_output_cosines=None
+    ):
+        if patch_ratio is None:
+            patch_ratio = self.relative_rms(patch_output, patch_input)
+        if patch_input_cosines is None:
+            patch_input_cosines = self.patch_pair_cosines(patch_input)
+        if patch_output_cosines is None:
+            patch_output_cosines = self.patch_pair_cosines(patch_output)
+        return torch.stack((
+            self.relative_rms(channel_local, channel_input),
+            patch_ratio,
+            self.relative_rms(channel_mixed, channel_local),
+            self.channel_pair_cosine(channel_local),
+            self.channel_pair_cosine(channel_mixed),
+            patch_input_cosines[0],
+            patch_output_cosines[0],
+            patch_input_cosines[1],
+            patch_output_cosines[1],
+        ))
+
+    def complete_statistics(
+        self, round_statistics, correction, reference=None,
+        reference_rms=None
+    ):
+        with torch.no_grad():
+            correction_rms = correction.detach().float().square().mean().sqrt()
+            if reference_rms is None:
+                reference_rms = (
+                    reference.detach().float().square().mean().sqrt()
+                )
+            result = torch.full(
+                (self.channel_depth, 11), float("nan"),
+                device=correction.device, dtype=torch.float32
+            )
+            result[:, :9] = torch.stack(round_statistics)
+            result[-1, 9] = correction_rms
+            result[-1, 10] = correction_rms / (reference_rms + 1e-12)
+            return result
+
+    # 每个 channel token 作为对应变量的唯一 K/V，只需执行 V 与 output projection。
     def shared_correction(self, latent_memory):
-        if latent_memory.shape[1] != 1:
-            raise RuntimeError(
-                "Shared correction requires exactly one Global Token."
-            )
         attention = self.patch_cross_attention
         if attention.training and attention.dropout != 0:
             raise RuntimeError(
@@ -240,30 +224,214 @@ class VariableAwareLatentAdapter(nn.Module):
         correction = F.linear(latent_memory, value_weight, value_bias)
         correction = attention.out_proj(correction)
         correction = self.patch_up(correction)
-        # 仅保留 [B,1,1,E]，后续依靠 broadcasting 注入当前 variable chunk。
         return correction.unsqueeze(2)
 
-    def correction_from_mean_memory(self, mean_patch_memory, num_variables):
-        latent_memory = self.global_latent_memory(
-            mean_patch_memory, num_variables
+    def correction_from_patch_memory(self, patch_memory):
+        batch_size, num_variables = patch_memory.shape[:2]
+        channel_tokens = self.initial_channel_tokens(
+            batch_size, num_variables
         )
-        return self.shared_correction(latent_memory)
+        statistics = []
+        for _ in range(self.channel_depth):
+            patch_input = patch_memory
+            channel_input = channel_tokens
+            patch_memory, channel_tokens = self.update_variable_tokens(
+                patch_memory, channel_tokens
+            )
+            channel_local = channel_tokens
+            channel_tokens = self.mix_channel_tokens(channel_local)
+            if self.collect_statistics:
+                statistics.append(self.round_statistics(
+                    channel_input, channel_local, channel_tokens,
+                    patch_input=patch_input, patch_output=patch_memory
+                ))
+        correction = self.shared_correction(channel_tokens)
+        return correction, statistics
 
     @staticmethod
     def apply_correction(patch_tokens, correction):
         return patch_tokens + correction
 
-    # 聚合所有变量的 patch token，并为每个 patch 注入同一个全局修正表示。
+    # 通过 channel tokens 交互，并为每个变量的 patch 注入对应修正。
     # shape 约定：B 为 batch size，V 为变量数，P 为可见 patch 数，E 为 embedding 维度。
     # 输入 patch_tokens 与输出 tensor 的 shape 均为 [B, V, P, E]。
-    def forward(self, patch_tokens):
+    def forward(self, patch_tokens, return_correction=False):
         # 从输入 shape [B, V, P, E] 中读取各维度大小。
         batch_size, num_variables, num_patches, embed_dim = patch_tokens.shape
-        # 归一化后恢复变量维，并对同一 patch 位置的所有变量直接求平均。
-        # 公共 patch memory 仅供 Global Token 第一阶段 attention 的 K/V 使用。
-        patch_memory = self.project_patch_memory(patch_tokens).mean(dim=1)
-        correction = self.correction_from_mean_memory(
-            patch_memory, num_variables
+        self.latest_statistics = None
+        patch_memory = self.project_patch_memory(patch_tokens)
+        correction, statistics = self.correction_from_patch_memory(patch_memory)
+        if self.collect_statistics:
+            self.latest_statistics = self.complete_statistics(
+                statistics, correction, reference=patch_tokens
+            )
+        output = self.apply_correction(patch_tokens, correction)
+        if return_correction:
+            return output, correction
+        return output
+
+
+class RelativePositionAttention(nn.Module):
+    def __init__(self, dim, num_heads, num_offsets):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("Attention dimension must be divisible by heads.")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.relative_bias = nn.Parameter(torch.zeros(num_heads, num_offsets))
+
+    def forward(self, x, bias_index, collect_statistics=False):
+        leading_shape = x.shape[:-2]
+        length, dim = x.shape[-2:]
+        x = x.reshape(-1, length, dim)
+        q = self.q_proj(x).reshape(
+            x.shape[0], length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        k = self.k_proj(x).reshape(
+            x.shape[0], length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        v = self.v_proj(x).reshape(
+            x.shape[0], length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        logits = logits + self.relative_bias[:, bias_index].unsqueeze(0)
+        weights = logits.softmax(dim=-1)
+        output = torch.matmul(weights, v).transpose(1, 2).reshape(
+            x.shape[0], length, dim
         )
-        # 不显式复制 correction；由加法自动 broadcast 到全部变量和 patch。
-        return self.apply_correction(patch_tokens, correction)
+        output = self.out_proj(output).reshape(*leading_shape, length, dim)
+        if not collect_statistics:
+            return output, None
+        with torch.no_grad():
+            probabilities = weights.detach().float()
+            if length > 1:
+                entropy = -(
+                    probabilities * probabilities.clamp_min(1e-12).log()
+                ).sum(dim=-1).mean() / math.log(length)
+            else:
+                entropy = probabilities.new_tensor(0.0)
+            masses = torch.stack([
+                probabilities[..., bias_index == offset].sum()
+                for offset in range(self.relative_bias.shape[1])
+            ])
+            masses = masses / probabilities.sum().clamp_min(1e-12)
+        return output, (entropy, masses)
+
+
+class TemporalPeriodicAdapter(nn.Module):
+    def __init__(
+        self, embed_dim=768, bottleneck_dim=64, num_heads=4,
+        num_rows=14, num_columns=1
+    ):
+        super().__init__()
+        self.num_rows = num_rows
+        self.num_columns = num_columns
+        self.center_norm = nn.LayerNorm(embed_dim)
+        self.down = nn.Linear(embed_dim, bottleneck_dim)
+        self.temporal_attention = RelativePositionAttention(
+            bottleneck_dim, num_heads, 2 * num_columns - 1
+        )
+        self.periodic_attention = RelativePositionAttention(
+            bottleneck_dim, num_heads, num_rows
+        )
+        self.output_norm = nn.LayerNorm(bottleneck_dim)
+        self.up = nn.Linear(bottleneck_dim, embed_dim)
+        nn.init.xavier_uniform_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+        columns = torch.arange(num_columns)
+        rows = torch.arange(num_rows)
+        self.register_buffer(
+            "temporal_bias_index",
+            columns[:, None] - columns[None, :] + num_columns - 1,
+        )
+        self.register_buffer(
+            "periodic_bias_index",
+            (rows[:, None] - rows[None, :]) % num_rows,
+        )
+
+    @staticmethod
+    def rms(x):
+        return x.detach().float().square().mean().sqrt()
+
+    @staticmethod
+    def pair_cosine(x):
+        x = F.normalize(x.detach().float(), dim=-1, eps=1e-12)
+        count = x.shape[-2]
+        if count == 1:
+            return x.new_tensor(1.0)
+        summed = x.sum(dim=-2)
+        diagonal = x.square().sum(dim=-1).sum(dim=-1)
+        return (
+            (summed.square().sum(dim=-1) - diagonal)
+            / (count * (count - 1))
+        ).mean()
+
+    def forward(self, patch_tokens, residual_gate, collect_statistics=False):
+        batch_size, num_variables, num_patches, embed_dim = patch_tokens.shape
+        if num_patches != self.num_rows * self.num_columns:
+            raise ValueError("Unexpected visible patch geometry.")
+        grid = patch_tokens.reshape(
+            batch_size, num_variables, self.num_rows,
+            self.num_columns, embed_dim
+        )
+        centered = grid - grid.mean(dim=(2, 3), keepdim=True)
+        hidden = self.down(self.center_norm(centered))
+        temporal = hidden.reshape(
+            batch_size, num_variables, self.num_rows,
+            self.num_columns, hidden.shape[-1]
+        )
+        temporal_update, temporal_statistics = self.temporal_attention(
+            temporal, self.temporal_bias_index, collect_statistics
+        )
+        temporal = temporal + temporal_update
+        periodic = temporal.permute(0, 1, 3, 2, 4)
+        periodic_update, periodic_statistics = self.periodic_attention(
+            periodic, self.periodic_bias_index, collect_statistics
+        )
+        periodic = periodic + periodic_update
+        hidden = periodic.permute(0, 1, 3, 2, 4)
+        raw_correction = self.up(self.output_norm(hidden))
+        applied_correction = residual_gate * raw_correction
+        output = grid + applied_correction
+        if not collect_statistics:
+            return output.reshape_as(patch_tokens), None
+        with torch.no_grad():
+            reference_rms = self.rms(grid)
+            raw_patch_cosine = self.pair_cosine(
+                grid.reshape(batch_size, num_variables, num_patches, embed_dim)
+            )
+            statistics = {
+                "raw_patch_cosine": raw_patch_cosine,
+                "centered_residual_ratio": self.rms(centered)
+                / (reference_rms + 1e-12),
+                "centered_patch_cosine": self.pair_cosine(
+                    centered.reshape(
+                        batch_size, num_variables, num_patches, embed_dim
+                    )
+                ),
+                "temporal_entropy": temporal_statistics[0],
+                "temporal_mass": temporal_statistics[1],
+                "periodic_entropy": periodic_statistics[0],
+                "periodic_mass": periodic_statistics[1],
+                "raw_correction_ratio": self.rms(raw_correction)
+                / (reference_rms + 1e-12),
+                "beta": residual_gate.detach().float(),
+                "applied_correction_ratio": self.rms(applied_correction)
+                / (reference_rms + 1e-12),
+                "update_patch_cosine": F.cosine_similarity(
+                    grid.detach().float(), applied_correction.detach().float(),
+                    dim=-1, eps=1e-12
+                ).mean(),
+                "before_adapter_cosine": raw_patch_cosine,
+                "after_adapter_cosine": self.pair_cosine(
+                    output.reshape(
+                        batch_size, num_variables, num_patches, embed_dim
+                    )
+                ),
+            }
+        return output.reshape_as(patch_tokens), statistics

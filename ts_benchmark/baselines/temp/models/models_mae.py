@@ -220,59 +220,6 @@ class MaskedAutoencoderViT(nn.Module):
         # 返回保留 feature、原顺序 mask 以及顺序恢复索引。
         return x_masked, mask, ids_restore
 
-    # 图片步骤 5～6：完整执行 LayerNorm1→Attention，在原 residual add 前取得 raw Attention 输出。
-    @staticmethod
-    def _attention_output(block, x):
-        # block.attn 会完整走完 QKV、softmax、多头合并和 output projection，不在内部截断。
-        update = block.attn(block.norm1(x))
-        # 当前构造的 init_values=None，因此 timm 的 ls1 是 Identity，不产生 LayerScale 缩放。
-        if getattr(block, "ls1", None) is not None:
-            update = block.ls1(update)
-        # 返回完整 Attention transformation 的最终输出，尚未与当前 hidden state 做 residual add。
-        return update
-
-    # 当前 drop_path=0；这里只保留拆分前 Block 的分支调用顺序，实际不做随机丢弃。
-    @staticmethod
-    def _attention_drop_path(block, update):
-        # 优先读取 drop_path1，旧版才回退到共享 drop_path；当前实际模块为 Identity。
-        drop_path = getattr(block, "drop_path1", getattr(block, "drop_path", None))
-        # None 或 Identity 都保持 update 不变，因此 residual 分支没有启用 DropPath。
-        return update if drop_path is None else drop_path(update)
-
-    # 图片步骤 5～6：完整执行 LayerNorm2→MLP，在原 residual add 前取得 raw MLP 输出。
-    @staticmethod
-    def _mlp_output(block, x):
-        # block.mlp 会完整走完两层 FFN、激活和内部 projection，不在 MLP 内部截断。
-        update = block.mlp(block.norm2(x))
-        # 当前构造的 init_values=None，因此 timm 的 ls2 是 Identity，不产生 LayerScale 缩放。
-        if getattr(block, "ls2", None) is not None:
-            update = block.ls2(update)
-        # 返回完整 MLP transformation 的最终输出，尚未与当前 hidden state 做 residual add。
-        return update
-
-    # 当前 drop_path=0；这里只保留拆分前 Block 的分支调用顺序，实际不做随机丢弃。
-    @staticmethod
-    def _mlp_drop_path(block, update):
-        # 优先读取 drop_path2，旧版才回退到共享 drop_path；当前实际模块为 Identity。
-        drop_path = getattr(block, "drop_path2", getattr(block, "drop_path", None))
-        # None 或 Identity 都保持 update 不变，因此 residual 分支没有启用 DropPath。
-        return update if drop_path is None else drop_path(update)
-
-    # 图片步骤 7：去掉 CLS，把 [B*V,P,D] 恢复并展平为真实 token 布局 [B,V*P,D]。
-    @staticmethod
-    def _real_patch_output(output, batch_size, num_variables):
-        # 这里只重排真实 patch，不跨 patch 求均值、std 或 sample-level signature。
-        return output[:, 1:, :].reshape(
-            batch_size, num_variables, output.shape[1] - 1, output.shape[2]
-        ).flatten(1, 2)
-
-    # 把 Router 输出的 [B,V*P,D] correction 还原为 MAE 主干使用的 [B*V,P,D]。
-    @staticmethod
-    def _restore_patch_output(output, batch_size, num_variables):
-        return output.reshape(
-            batch_size * num_variables, -1, output.shape[-1]
-        )
-
     def prepare_visible_patches(self, x, mask_ratio, noise=None):
         # 将输入图像映射为 patch embedding sequence。
         x = self.patch_embed(x)
@@ -284,17 +231,16 @@ class MaskedAutoencoderViT(nn.Module):
     # 对 patch 执行 encoder，并返回 latent、mask 和顺序恢复索引。
     def forward_encoder(self, x, mask_ratio, noise=None, variable_adapter=None,
                         batch_size=None, num_variables=None,
-                        residual_router=None, variable_correction=None):
+                        variable_correction=None):
         # 输入 x shape 为 [N, C, H, W]，可选 noise shape 为 [N, L]。
         # 返回 latent [N, 1+L_keep, D]、mask [N, L] 和 ids_restore [N, L]。
         # N 是图像 batch size，C/H/W 是 channel/高/宽，L 与 L_keep 是总 patch 数与保留 patch 数。
         # D 是 encoder embedding 维度；启用 variable adapter 时 N=B*V，B/V 是原 batch size/变量数。
-        # residual_router 为 None 时执行原始 MAE；非空时按图片步骤 2～11 路由 Block 6～12。
         x, mask, ids_restore = self.prepare_visible_patches(
             x, mask_ratio, noise
         )
 
-        # 图片步骤 1：Global Token 在 MAE Transformer 前提取并广播真实 patch 的公共成分。
+        # channel-token adapter 在 MAE Transformer 前完成变量交互与逐变量修正。
         if variable_adapter is not None:
             # 使用必需的 batch_size=B 和 num_variables=V，将 [N,L_keep,D] reshape 为 [B,V,L_keep,D]。
             x = x.reshape(batch_size, num_variables, x.shape[1], x.shape[2])
@@ -316,118 +262,8 @@ class MaskedAutoencoderViT(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
 
         # 依次通过所有 encoder Transformer block。
-        if residual_router is None:
-            # 未提供路由器时保持原始 MAE encoder 路径，直接调用每个完整 Block。
-            for blk in self.blocks:
-                x = blk(x)
-        else:
-            # 图片步骤 3：Block 1～4 完整正常前向，不参与 Router，也不保存 residual source。
-            for block_index in range(4):
-                x = self.blocks[block_index](x)
-
-            # 图片步骤 5：Block 5 是 source-only Block，不执行 depth routing 或 correction。
-            block = self.blocks[4]
-            # 它只产生供 Block 6 以后使用的 D5-A/D5-M，不读取任何 residual source。
-            source_values = []
-            source_keys = []
-            # 以 x0 完整执行 LayerNorm1→Attention，在 x1=x0+D5-A 前保存 raw D5-A。
-            attention_output = self._attention_output(block, x)
-            # 去掉 CLS 后，D5-A 的真实 patch source 形状为 [B,V*P,D]。
-            source = self._real_patch_output(
-                attention_output, batch_size, num_variables
-            )
-            # 保存 raw D5-A 作为 Value，并只为 Key 做无参数逐 token RMSNorm。
-            source_values.append(source)
-            source_keys.append(residual_router.make_key(source))
-            # DropPath 当前关闭；按原 frozen MAE 正常执行 x1=x0+D5-A。
-            x = x + self._attention_drop_path(block, attention_output)
-            # 再以 x1 完整执行 LayerNorm2→MLP，并在 x2=x1+D5-M 前保存 raw D5-M。
-            mlp_output = self._mlp_output(block, x)
-            # 去掉 CLS 后，D5-M 同样以 [B,V*P,D] 保存，且不覆盖 D5-A。
-            source = self._real_patch_output(
-                mlp_output, batch_size, num_variables
-            )
-            # 保存 raw D5-M Value 及其逐 token RMSNorm Key，供 Block 6～12 使用。
-            source_values.append(source)
-            source_keys.append(residual_router.make_key(source))
-            # DropPath 当前关闭；按原 frozen MAE 正常执行 x2=x1+D5-M，得到 H5。
-            x = x + self._mlp_drop_path(block, mlp_output)
-
-            # 图片步骤 6/8：14 个 target 依次为 B6-A、B6-M、…、B12-A、B12-M。
-            target_index = 0
-            # Block 6～12 均重复“旧 source 路由→修正 sublayer 输入→保存 raw 输出→原 residual add”。
-            for block_index in range(5, 12):
-                # Python 下标 5～11 对应人类编号 Block 6～12，先处理当前 Block-Attention。
-                block = self.blocks[block_index]
-                # 图片步骤 8～11：Bk-A 先仅用此前 source 计算逐 token 输入侧 correction。
-                depth_correction, routing_weights = residual_router.route(
-                    target_index, source_values, source_keys
-                )
-                # 将 [B,V*P,D] correction 恢复为 [B*V,P,D]，但不改写原 residual stream。
-                input_correction = self._restore_patch_output(
-                    depth_correction, batch_size, num_variables
-                )
-                # CLS correction 严格为 0，仅真实 patch 读取历史 depth information。
-                input_correction = torch.cat((
-                    torch.zeros_like(x[:, :1, :]), input_correction
-                ), dim=1)
-                # 图片步骤 11：correction 只进入 LayerNorm1→Frozen Attention 的输入。
-                attention_output = self._attention_output(
-                    block, x + input_correction
-                )
-                # 完整 Attention 输出在 residual add 前保存为 raw source，供后续 target 使用。
-                source = self._real_patch_output(
-                    attention_output, batch_size, num_variables
-                )
-                source_key = residual_router.make_key(source)
-                # 当前 raw source 产生后再记录原统计；它未参与自己的 routing weights。
-                residual_router.record_statistics(
-                    target_index, routing_weights, depth_correction, source
-                )
-                # 原 identity residual 保留：x1=原 x+Attention(LayerNorm1(x+correction))。
-                x = x + self._attention_drop_path(block, attention_output)
-                # 当前 raw Bk-A 从此进入 source pool，仅供后续 MLP/Block 使用。
-                source_values.append(source)
-                source_keys.append(source_key)
-                # raw Attention source 不被覆盖；target_index 推进到同一 Block 的 MLP query。
-                target_index += 1
-
-                # Bk-M 可读取刚保存的 Bk-A，但仍不读取尚未产生的自身 MLP 输出。
-                depth_correction, routing_weights = residual_router.route(
-                    target_index, source_values, source_keys
-                )
-                # 将 patch correction 恢复到 MAE 布局，不把它写入当前 residual hidden state。
-                input_correction = self._restore_patch_output(
-                    depth_correction, batch_size, num_variables
-                )
-                # CLS 不参与 depth routing，因此在输入侧 correction 前补一个全零位置。
-                input_correction = torch.cat((
-                    torch.zeros_like(x[:, :1, :]), input_correction
-                ), dim=1)
-                # 图片步骤 11：correction 只进入 LayerNorm2→Frozen MLP 的输入。
-                mlp_output = self._mlp_output(
-                    block, x + input_correction
-                )
-                # 完整 MLP 输出在 residual add 前保存为 raw source，供后续 target 使用。
-                source = self._real_patch_output(
-                    mlp_output, batch_size, num_variables
-                )
-                source_key = residual_router.make_key(source)
-                # MLP raw source 产生后再完成统计，correction_ratio 定义保持不变。
-                residual_router.record_statistics(
-                    target_index, routing_weights, depth_correction, source
-                )
-                # 原 identity residual 保留：x2=原 x+MLP(LayerNorm2(x+correction))。
-                x = x + self._mlp_drop_path(block, mlp_output)
-                # 当前 raw Bk-M 从此进入 source pool，仅供下一 Attention/MLP 使用。
-                source_values.append(source)
-                source_keys.append(source_key)
-                # raw MLP source 保持不变；target_index 推进到下一 Block 的 Attention query。
-                target_index += 1
-
-            # 图片仅定义到 Block 12；large/huge 的 Block 13 以后恢复原始完整 frozen Block。
-            for block_index in range(12, len(self.blocks)):
-                x = self.blocks[block_index](x)
+        for blk in self.blocks:
+            x = blk(x)
         # 对 encoder 输出执行最终 LayerNorm。
         x = self.norm(x)
 
@@ -513,20 +349,17 @@ class MaskedAutoencoderViT(nn.Module):
 
     # 执行完整 forward，依次经过 encoder、decoder 并返回预测和 mask。
     def forward(self, imgs, mask_ratio=0.75, noise=None, variable_adapter=None,
-                batch_size=None, num_variables=None, residual_router=None,
-                variable_correction=None):
+                batch_size=None, num_variables=None, variable_correction=None):
         # 输入 imgs shape 为 [N,C,H,W]，可选 noise shape 为 [N,L]；N/C/H/W 是 batch/channel/高/宽。
         # 启用 variable adapter 时 N=B*V，B/V 分别是原 batch size 和变量数。
         # point 模式返回 (None, pred, mask)，pred [N,L,p**2*C]，mask [N,L]。
         # quantile 模式的 pred 为 (x_mid, x_quantile_list)，x_mid shape 为 [N,L,p**2*C]。
         # x_quantile_list 内每个 tensor 的 shape 同 x_mid，列表长度为 quantile_head_num-1。
         # L 是 patch 数，p 是 patch 边长，C 是 channel 数。
-        # residual_router 是外层创建的逐 token 深度 Router；为 None 时不改变原 MAE。
         # 通过 encoder 处理输入图像，并获取 mask 及恢复原序所需索引。
         latent, mask, ids_restore = self.forward_encoder(
             imgs, mask_ratio, noise, variable_adapter, batch_size, num_variables,
-            # 仅把 Router 透传给 encoder；Decoder、decoder_norm 和 decoder_pred 保持原 frozen 路径。
-            residual_router, variable_correction
+            variable_correction
         )
         # 通过 decoder 将 latent 转换为每个 patch 的 pixel 或 quantile prediction。
         pred = self.forward_decoder(latent, ids_restore)

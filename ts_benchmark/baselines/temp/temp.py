@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 from pathlib import Path
+from torch.utils.data import DataLoader
 
 # 导入 TFB 深度预测模型基类，复用通用训练与预测流程。
 from ts_benchmark.baselines.deep_forecasting_model_base import (
@@ -34,9 +35,10 @@ MODEL_HYPER_PARAMS = {
     "norm_const": 0.4,  # 设置输入 normalization 的缩放常数。
     "align_const": 0.4,  # 设置图像尺寸对齐时的控制常数。
     "interpolation": "bilinear",  # 使用 bilinear interpolation 调整输入尺寸。
-    "num_latents": 1,  # 使用单个 latent query 聚合全局修正表示。
+    "num_latents": 1,  # 每个变量使用一个 channel token。
     "latent_dim": 192,  # 设置 latent embedding 的维度。
     "adapter_num_heads": 4,  # 设置 adapter 的 attention head 数量。
+    "channel_depth": 1,
     "use_variable_chunk": False,  # 是否启用固定 16-variable 的低显存分块流程。
     "fp64": False,  # 默认不使用 float64 计算。
     "batch_size": 32,  # 设置默认训练 batch size。
@@ -67,17 +69,52 @@ class VisionTS(DeepForecastingModelBase):
         )
         self._run_id = hashlib.sha256(fingerprint.encode()).hexdigest()[:32]
         self._output_dir = None
-        self._artifact_horizon = None
-        self._routing_epoch = 0
-        self._routing_learning_rows = []
-        self._variable_names = []
-        self._global_test_batch_active = False
+        self._collect_channel_statistics = False
+        self._channel_statistics_horizon = None
+        self._channel_statistics_sum = None
+        self._channel_statistics_count = None
+        self._channel_statistics_batch_active = False
+        self._validation_epoch = 0
+        self._best_validation_mse = float("inf")
+        self._best_relative_biases = None
+        self._series_dim = None
 
     # 将模型名称暴露给 TFB 的注册与记录流程。
     @property
     def model_name(self):
         # 返回统一使用的模型标识。
         return "VisionTS"
+
+    def _init_criterion_and_optimizer(self):
+        gate = self._core_model().fusion_logit
+        adapter_parameters = [
+            parameter for parameter in self.model.parameters()
+            if parameter.requires_grad and parameter is not gate
+        ]
+        optimizer = torch.optim.Adam([
+            {
+                "params": adapter_parameters,
+                "lr": self.config.lr,
+                "parameter_group": "adapters",
+            },
+            {
+                "params": [gate],
+                "lr": 10 * self.config.lr,
+                "weight_decay": 0.0,
+                "parameter_group": "gate",
+            },
+        ])
+        return torch.nn.MSELoss(), optimizer
+
+    def _adjust_lr(self, optimizer, epoch, config):
+        super()._adjust_lr(optimizer, epoch, config)
+        adapter_lr = next(
+            group["lr"] for group in optimizer.param_groups
+            if group["parameter_group"] == "adapters"
+        )
+        for group in optimizer.param_groups:
+            if group["parameter_group"] == "gate":
+                group["lr"] = 10 * adapter_lr
 
     # 根据当前配置创建并初始化底层 VisionTS 模型。
     def _init_model(self):
@@ -89,9 +126,10 @@ class VisionTS(DeepForecastingModelBase):
             arch=self.config.arch,  # 指定模型 backbone architecture。
             ckpt_path=checkpoint_path,  # 指定 pretrained checkpoint 路径。
             load_ckpt=self.config.load_ckpt,  # 控制是否加载 pretrained checkpoint。
-            num_latents=self.config.num_latents,  # 传入全局修正 latent query 数量。
+            num_latents=self.config.num_latents,  # 传入每个变量的 channel token 数量。
             latent_dim=self.config.latent_dim,  # 传入 latent embedding 维度。
             adapter_num_heads=self.config.adapter_num_heads,  # 传入 attention head 数量。
+            channel_depth=self.config.channel_depth,
         )
         # 补充与当前预测任务相关、需要在运行时确定的配置。
         model.update_config(
@@ -197,15 +235,11 @@ class VisionTS(DeepForecastingModelBase):
         train_ratio_in_tv=1.0,
         **kwargs,
     ):
+        self._series_dim = train_valid_data.shape[-1]
+        self._validation_epoch = 0
+        self._best_validation_mse = float("inf")
+        self._best_relative_biases = None
         dataset_name = self._dataset_name(train_valid_data, covariates)
-        variable_names = list(train_valid_data.columns)
-        exog_data = (covariates or {}).get("exog")
-        if exog_data is not None:
-            variable_names.extend(exog_data.columns)
-        self._variable_names = [str(name) for name in variable_names]
-        self._routing_epoch = 0
-        self._routing_learning_rows = []
-        self._global_test_batch_active = False
         self._output_dir = (
             Path(__file__).resolve().parent
             / dataset_name
@@ -227,7 +261,160 @@ class VisionTS(DeepForecastingModelBase):
                 train_ratio_in_tv=train_ratio_in_tv,
                 **kwargs,
             )
+        self._save_best_relative_biases()
         return result
+
+    @staticmethod
+    def _scalar(value):
+        if torch.is_tensor(value):
+            return value.detach().float().mean().cpu().item()
+        return float(value)
+
+    def _save_validation_statistics(self, row):
+        if self._output_dir is None:
+            return
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        path = self._output_dir / (
+            f"horizon{self.config.horizon}_stage3_internal_statistics.csv"
+        )
+        pd.DataFrame([row]).to_csv(
+            path, mode="a", header=not path.exists(), index=False,
+            float_format="%.8g"
+        )
+
+    def _capture_best_relative_biases(self, validation_mse):
+        if validation_mse >= self._best_validation_mse:
+            return
+        self._best_validation_mse = validation_mse
+        self._best_relative_biases = tuple(
+            (
+                adapter.temporal_attention.relative_bias.detach().cpu().clone(),
+                adapter.periodic_attention.relative_bias.detach().cpu().clone(),
+            )
+            for adapter in self._core_model().temporal_periodic_adapters
+        )
+
+    def _save_best_relative_biases(self):
+        if self._output_dir is None or self._best_relative_biases is None:
+            return
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        temporal_offsets = range(
+            -self._core_model().num_patch_input + 1,
+            self._core_model().num_patch_input,
+        )
+        for stage, (temporal, periodic) in zip(
+            ("early", "middle", "deep"), self._best_relative_biases
+        ):
+            pd.DataFrame(
+                temporal.numpy(),
+                columns=[str(offset) for offset in temporal_offsets],
+            ).to_csv(
+                self._output_dir / f"temporal_relative_bias_{stage}.csv",
+                index=False,
+                float_format="%.8g",
+            )
+            pd.DataFrame(
+                periodic.numpy(), columns=[str(offset) for offset in range(14)]
+            ).to_csv(
+                self._output_dir / f"periodic_relative_bias_{stage}.csv",
+                index=False,
+                float_format="%.8g",
+            )
+
+    def validate(self, valid_data_loader, series_dim, criterion):
+        config = self.config
+        valid_data_loader = DataLoader(
+            valid_data_loader.dataset,
+            batch_size=valid_data_loader.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            drop_last=False,
+        )
+        self._validation_epoch += 1
+        self.model.eval()
+        device = get_device()
+        square_sums = {
+            "channel": 0.0,
+            "tp": 0.0,
+            "fused": 0.0,
+            "disagreement": 0.0,
+        }
+        value_count = 0
+        error_dot = 0.0
+        channel_error_square = 0.0
+        tp_error_square = 0.0
+        diagnostics = None
+        with torch.no_grad():
+            for batch_index, (
+                input, target, input_mark, target_mark
+            ) in enumerate(valid_data_loader):
+                input, target = input.to(device), target.to(device)
+                result = self.model(
+                    input,
+                    fp64=config.fp64,
+                    use_variable_chunk=config.use_variable_chunk,
+                    return_branches=True,
+                    return_diagnostics=batch_index == 0,
+                )
+                if batch_index == 0:
+                    diagnostics = {
+                        key: self._scalar(value)
+                        for key, value in result["diagnostics"].items()
+                    }
+                target = target[:, -config.horizon:, :series_dim]
+                predictions = {
+                    name: result[name][:, -config.horizon:, :series_dim]
+                    for name in ("channel", "tp", "output")
+                }
+                channel, target_processed = self._post_process(
+                    predictions["channel"], target
+                )
+                tp, _ = self._post_process(predictions["tp"], target)
+                fused, _ = self._post_process(predictions["output"], target)
+                channel_error = (channel - target_processed).double()
+                tp_error = (tp - target_processed).double()
+                fused_error = (fused - target_processed).double()
+                square_sums["channel"] += channel_error.square().sum().item()
+                square_sums["tp"] += tp_error.square().sum().item()
+                square_sums["fused"] += fused_error.square().sum().item()
+                disagreement = (
+                    result["channel_normalized"][:, :, :series_dim]
+                    - result["tp_normalized"][:, :, :series_dim]
+                ).double()
+                square_sums["disagreement"] += (
+                    disagreement.square().sum().item()
+                )
+                value_count += fused_error.numel()
+                error_dot += (channel_error * tp_error).sum().item()
+                channel_error_square += channel_error.square().sum().item()
+                tp_error_square += tp_error.square().sum().item()
+        val_mse_channel = square_sums["channel"] / value_count
+        val_mse_tp = square_sums["tp"] / value_count
+        val_mse_fused = square_sums["fused"] / value_count
+        branch_error_cosine = error_dot / (
+            np.sqrt(channel_error_square * tp_error_square) + 1e-12
+        )
+        row = {
+            "epoch": self._validation_epoch,
+            "val_mse_channel": val_mse_channel,
+            "val_mse_tp": val_mse_tp,
+            "val_mse_fused": val_mse_fused,
+            "fusion_gate_g": self._scalar(
+                torch.sigmoid(self._core_model().fusion_logit)
+            ),
+            "prediction_disagreement_rms": np.sqrt(
+                square_sums["disagreement"] / value_count
+            ),
+            "branch_error_cosine": branch_error_cosine,
+            "fusion_gain_over_best_branch": (
+                min(val_mse_channel, val_mse_tp) - val_mse_fused
+            ),
+            **(diagnostics or {}),
+        }
+        self._save_validation_statistics(row)
+        self._capture_best_relative_biases(val_mse_fused)
+        self.model.train()
+        return val_mse_fused
 
     def _backward_variable_chunks(
         self, input, target, series_dim, criterion, scaler=None
@@ -238,48 +425,56 @@ class VisionTS(DeepForecastingModelBase):
         )
         correction = context["correction"]
         correction_leaf = correction.detach().requires_grad_(True)
-        router = model.residual_router
-        router.begin_variable_chunk_statistics()
-        try:
-            for start in range(
-                0, context["num_variables"], model.variable_chunk_size
-            ):
-                end = min(
-                    start + model.variable_chunk_size,
-                    context["num_variables"],
-                )
-                supervised_end = min(end, series_dim)
-                supervised_width = max(0, supervised_end - start)
+        for start in range(
+            0, context["num_variables"], model.variable_chunk_size
+        ):
+            end = min(
+                start + model.variable_chunk_size,
+                context["num_variables"],
+            )
+            supervised_end = min(end, series_dim)
+            supervised_width = max(0, supervised_end - start)
 
-                if supervised_width == 0:
-                    # exogenous-only 块没有 forecasting loss，仅保留原 routing 统计。
-                    with torch.no_grad():
-                        model.forward_variable_chunk(
-                            context, start, end, correction=correction_leaf
-                        )
-                    continue
+            if supervised_width == 0:
+                continue
 
-                output = model.forward_variable_chunk(
-                    context, start, end, correction=correction_leaf
-                )
-                output = output[
-                    :, -self.config.horizon:, :supervised_width
-                ]
-                chunk_target = target[
-                    :, -self.config.horizon:, start:supervised_end
-                ]
-                output, chunk_target = self._post_process(
-                    output, chunk_target
-                )
-                weighted_loss = criterion(output, chunk_target) * (
-                    supervised_width / series_dim
-                )
-                if scaler is None:
-                    weighted_loss.backward()
-                else:
-                    scaler.scale(weighted_loss).backward()
-        finally:
-            router.end_variable_chunk_statistics()
+            result = model.forward_variable_chunk(
+                context,
+                start,
+                end,
+                correction=correction_leaf,
+                return_branches=True,
+            )
+            channel = result["channel"][
+                :, -self.config.horizon:, :supervised_width
+            ]
+            tp = result["tp"][
+                :, -self.config.horizon:, :supervised_width
+            ]
+            chunk_target = target[
+                :, -self.config.horizon:, start:supervised_end
+            ]
+            channel, processed_target = self._post_process(
+                channel, chunk_target
+            )
+            tp, _ = self._post_process(
+                tp, chunk_target
+            )
+            gate = torch.sigmoid(model.fusion_logit)
+            gate_prediction = (
+                gate * channel.detach() + (1 - gate) * tp.detach()
+            )
+            weighted_loss = (
+                criterion(channel, processed_target)
+                + criterion(tp, processed_target)
+                + criterion(gate_prediction, processed_target)
+            ) * (
+                supervised_width / series_dim
+            )
+            if scaler is None:
+                weighted_loss.backward()
+            else:
+                scaler.scale(weighted_loss).backward()
 
         # 各块已把梯度累积到小 correction leaf；这里只回传一次完整 Global 图。
         if correction_leaf.grad is not None and correction.requires_grad:
@@ -340,7 +535,7 @@ class VisionTS(DeepForecastingModelBase):
                 config,
                 timeenc=1,
                 batch_size=config.batch_size,
-                shuffle=True,
+                shuffle=False,
                 drop_last=False,
             )
 
@@ -408,400 +603,150 @@ class VisionTS(DeepForecastingModelBase):
     def _core_model(self):
         return getattr(self.model, "module", self.model)
 
-    def _set_routing_statistics_mode(self, mode):
-        if self.model is not None:
-            self._core_model().set_routing_statistics_mode(mode)
-
-    def _reset_global_test_collection(self):
-        self._core_model().reset_global_token_statistics()
-
-    def validate(self, valid_data_loader, series_dim, criterion):
-        self._set_routing_statistics_mode("validation")
-        try:
-            val_loss = super().validate(
-                valid_data_loader, series_dim, criterion
-            )
-        finally:
-            self._set_routing_statistics_mode("train")
-        records = self._core_model().pop_routing_learning_records()
-        if records:
-            self._routing_epoch += 1
-            for record in records:
-                self._routing_learning_rows.append({
-                    "epoch": self._routing_epoch,
-                    **record,
-                    "val_loss": float(val_loss),
-                })
-        return val_loss
-
-    def _routing_deviation_frame(self):
-        model = self._core_model()
-        metadata = model.routing_metadata()
-        source_names = list(metadata["source_names"])
-        target_names = list(metadata["target_names"])
-        matrix = model.routing_deviation_matrix()
-        if matrix is None:
-            return pd.DataFrame(), metadata
-        frame = pd.DataFrame(
-            matrix.numpy(), index=target_names, columns=source_names
+    def _reset_channel_statistics(self, horizon):
+        shape = (self.config.channel_depth, 11)
+        self._channel_statistics_horizon = horizon
+        self._channel_statistics_sum = torch.zeros(shape, dtype=torch.float64)
+        self._channel_statistics_count = torch.zeros(
+            shape, dtype=torch.float64
         )
-        frame.index.name = "target_branch"
-        return frame, metadata
 
-    _global_token_columns = [
-        "record_type", "sample_index", "global_token_index",
-        "variable_index", "variable_name", "other_variable_index",
-        "other_variable_name", "patch_index", "statistic", "value"
-    ]
-
-    @classmethod
-    def _global_token_frame(cls, record_type, values, **coordinates):
-        values = np.asarray(values).reshape(-1)
-        row_count = values.size
-        data = {
-            "record_type": np.full(row_count, record_type, dtype=object),
-            "sample_index": np.full(row_count, np.nan),
-            "global_token_index": np.full(row_count, np.nan),
-            "variable_index": np.full(row_count, np.nan),
-            "variable_name": np.full(row_count, "", dtype=object),
-            "other_variable_index": np.full(row_count, np.nan),
-            "other_variable_name": np.full(row_count, "", dtype=object),
-            "patch_index": np.full(row_count, np.nan),
-            "statistic": np.full(row_count, "", dtype=object),
-            "value": values,
-        }
-        for name, coordinate in coordinates.items():
-            coordinate = np.asarray(coordinate)
-            if coordinate.ndim == 0:
-                coordinate = np.full(row_count, coordinate.item())
-            else:
-                coordinate = coordinate.reshape(-1)
-            if coordinate.size != row_count:
-                raise ValueError(
-                    f"Coordinate {name!r} does not match statistic rows."
-                )
-            data[name] = coordinate
-        return pd.DataFrame(data, columns=cls._global_token_columns)
-
-    @staticmethod
-    def _entropy_summaries(values):
-        statistic_names = (
-            "mean", "std", "min", "p25", "median", "p75", "max"
+    def _accumulate_channel_statistics(self, statistics):
+        statistics = statistics.detach().cpu().to(torch.float64).reshape(
+            -1, self.config.channel_depth, 11
         )
-        if np.isnan(values).all():
-            empty = np.full(values.shape[1], np.nan)
-            return [(name, empty.copy()) for name in statistic_names]
-        return [
-            ("mean", np.nanmean(values, axis=0)),
-            ("std", np.nanstd(values, axis=0, ddof=0)),
-            ("min", np.nanmin(values, axis=0)),
-            ("p25", np.nanpercentile(values, 25, axis=0)),
-            ("median", np.nanpercentile(values, 50, axis=0)),
-            ("p75", np.nanpercentile(values, 75, axis=0)),
-            ("max", np.nanmax(values, axis=0)),
-        ]
+        valid = torch.isfinite(statistics)
+        self._channel_statistics_sum.add_(
+            torch.where(valid, statistics, 0).sum(dim=0)
+        )
+        self._channel_statistics_count.add_(valid.sum(dim=0))
 
-    def _global_token_statistic_frames(self):
-        statistics = self._core_model().global_token_statistics()
-        if statistics is None:
+    def _channel_statistics_frame(self):
+        count = self._channel_statistics_count
+        values = self._channel_statistics_sum / count.clamp_min(1)
+        values[count == 0] = float("nan")
+        return pd.DataFrame({
+            "horizon": self._channel_statistics_horizon,
+            "round": range(1, self.config.channel_depth + 1),
+            "intra_channel_update_ratio": values[:, 0].numpy(),
+            "intra_patch_update_ratio": values[:, 1].numpy(),
+            "inter_channel_update_ratio": values[:, 2].numpy(),
+            "channel_pair_cosine_before_inter": values[:, 3].numpy(),
+            "channel_pair_cosine": values[:, 4].numpy(),
+            "within_variable_patch_cosine_before_intra": values[:, 5].numpy(),
+            "within_variable_patch_cosine": values[:, 6].numpy(),
+            "between_variable_patch_cosine_before_intra": values[:, 7].numpy(),
+            "between_variable_patch_cosine": values[:, 8].numpy(),
+            "correction_rms": values[:, 9].numpy(),
+            "correction_to_patch_rms_ratio": values[:, 10].numpy(),
+        })
+
+    def _save_channel_statistics(self):
+        if self._output_dir is None or self._channel_statistics_sum is None:
             return
-
-        variable_routing = statistics["variable_routing"].numpy()
-        patch_routing = statistics["patch_routing"].numpy()
-        variable_entropy = statistics["variable_entropy"].numpy()
-        patch_entropy = statistics["patch_entropy"].numpy()
-        temporal_profile = statistics["temporal_profile"].numpy()
-        temporal_similarity = statistics[
-            "temporal_cosine_similarity"
-        ].numpy()
-
-        sample_count, num_global_tokens, num_variables = (
-            variable_routing.shape
-        )
-        num_patches = patch_routing.shape[-1]
-        if len(self._variable_names) == num_variables:
-            variable_names = np.asarray(self._variable_names, dtype=object)
-        else:
-            variable_names = np.asarray([
-                f"variable_{index}" for index in range(num_variables)
-            ], dtype=object)
-
-        # Sample-level distributions are chunked only for CSV memory usage;
-        # no sample or head is averaged at the attention capture point.
-        max_frame_rows = 200_000
-        variable_rows_per_sample = num_global_tokens * num_variables
-        samples_per_frame = max(
-            1, max_frame_rows // variable_rows_per_sample
-        )
-        for start in range(0, sample_count, samples_per_frame):
-            end = min(start + samples_per_frame, sample_count)
-            chunk_sample_count = end - start
-            variable_index = np.tile(
-                np.arange(num_variables), chunk_sample_count * num_global_tokens
-            )
-            yield self._global_token_frame(
-                "sample_variable_routing",
-                variable_routing[start:end].reshape(-1),
-                sample_index=np.repeat(
-                    np.arange(start, end), variable_rows_per_sample
-                ),
-                global_token_index=np.tile(
-                    np.repeat(np.arange(num_global_tokens), num_variables),
-                    chunk_sample_count
-                ),
-                variable_index=variable_index,
-                variable_name=variable_names[variable_index],
-            )
-
-        summary_global_index = np.repeat(
-            np.arange(num_global_tokens), num_variables
-        )
-        summary_variable_index = np.tile(
-            np.arange(num_variables), num_global_tokens
-        )
-        for statistic, values in (
-            ("mean", variable_routing.mean(axis=0)),
-            ("std", variable_routing.std(axis=0, ddof=0)),
-        ):
-            yield self._global_token_frame(
-                "variable_routing_summary", values.reshape(-1),
-                global_token_index=summary_global_index,
-                variable_index=summary_variable_index,
-                variable_name=variable_names[summary_variable_index],
-                statistic=statistic,
-            )
-
-        entropy_sample_index = np.repeat(
-            np.arange(sample_count), num_global_tokens
-        )
-        entropy_global_index = np.tile(
-            np.arange(num_global_tokens), sample_count
-        )
-        yield self._global_token_frame(
-            "sample_variable_normalized_entropy",
-            variable_entropy.reshape(-1),
-            sample_index=entropy_sample_index,
-            global_token_index=entropy_global_index,
-        )
-        for statistic, values in self._entropy_summaries(variable_entropy):
-            yield self._global_token_frame(
-                "variable_normalized_entropy_summary", values,
-                global_token_index=np.arange(num_global_tokens),
-                statistic=statistic,
-            )
-
-        patch_rows_per_sample = num_global_tokens * num_patches
-        samples_per_frame = max(1, max_frame_rows // patch_rows_per_sample)
-        for start in range(0, sample_count, samples_per_frame):
-            end = min(start + samples_per_frame, sample_count)
-            chunk_sample_count = end - start
-            yield self._global_token_frame(
-                "sample_patch_routing",
-                patch_routing[start:end].reshape(-1),
-                sample_index=np.repeat(
-                    np.arange(start, end), patch_rows_per_sample
-                ),
-                global_token_index=np.tile(
-                    np.repeat(np.arange(num_global_tokens), num_patches),
-                    chunk_sample_count
-                ),
-                patch_index=np.tile(
-                    np.arange(num_patches),
-                    chunk_sample_count * num_global_tokens
-                ),
-            )
-
-        summary_global_index = np.repeat(
-            np.arange(num_global_tokens), num_patches
-        )
-        summary_patch_index = np.tile(
-            np.arange(num_patches), num_global_tokens
-        )
-        for statistic, values in (
-            ("mean", patch_routing.mean(axis=0)),
-            ("std", patch_routing.std(axis=0, ddof=0)),
-        ):
-            yield self._global_token_frame(
-                "patch_routing_summary", values.reshape(-1),
-                global_token_index=summary_global_index,
-                patch_index=summary_patch_index,
-                statistic=statistic,
-            )
-
-        yield self._global_token_frame(
-            "sample_patch_normalized_entropy", patch_entropy.reshape(-1),
-            sample_index=entropy_sample_index,
-            global_token_index=entropy_global_index,
-        )
-        for statistic, values in self._entropy_summaries(patch_entropy):
-            yield self._global_token_frame(
-                "patch_normalized_entropy_summary", values,
-                global_token_index=np.arange(num_global_tokens),
-                statistic=statistic,
-            )
-
-        profile_global_index = np.repeat(
-            np.arange(num_global_tokens), num_variables * num_patches
-        )
-        profile_variable_index = np.tile(
-            np.repeat(np.arange(num_variables), num_patches),
-            num_global_tokens
-        )
-        yield self._global_token_frame(
-            "variable_patch_temporal_profile", temporal_profile.reshape(-1),
-            global_token_index=profile_global_index,
-            variable_index=profile_variable_index,
-            variable_name=variable_names[profile_variable_index],
-            patch_index=np.tile(
-                np.arange(num_patches), num_global_tokens * num_variables
-            ),
-            statistic="mean_over_samples_and_heads",
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        frame = self._channel_statistics_frame()
+        prefix = f"horizon{self._channel_statistics_horizon}_channel_module"
+        frame.to_csv(
+            self._output_dir / f"{prefix}.csv", index=False,
+            float_format="%.8g"
         )
 
-        variables_per_frame = max(1, max_frame_rows // num_variables)
-        for global_token_index in range(num_global_tokens):
-            for start in range(0, num_variables, variables_per_frame):
-                end = min(start + variables_per_frame, num_variables)
-                first_variable_index = np.repeat(
-                    np.arange(start, end), num_variables
-                )
-                second_variable_index = np.tile(
-                    np.arange(num_variables), end - start
-                )
-                yield self._global_token_frame(
-                    "variable_temporal_cosine_similarity",
-                    temporal_similarity[
-                        global_token_index, start:end
-                    ].reshape(-1),
-                    global_token_index=global_token_index,
-                    variable_index=first_variable_index,
-                    variable_name=variable_names[first_variable_index],
-                    other_variable_index=second_variable_index,
-                    other_variable_name=variable_names[second_variable_index],
-                    statistic="mean_over_samples_and_heads",
-                )
-
-            if num_variables > 1:
-                off_diagonal = temporal_similarity[global_token_index][
-                    ~np.eye(num_variables, dtype=bool)
-                ]
-                off_diagonal_values = np.asarray([
-                    off_diagonal.mean(), off_diagonal.std(ddof=0)
-                ])
-            else:
-                off_diagonal_values = np.asarray([np.nan, np.nan])
-            yield self._global_token_frame(
-                "variable_temporal_cosine_off_diagonal_summary",
-                off_diagonal_values,
-                global_token_index=global_token_index,
-                statistic=np.asarray(["mean", "std"], dtype=object),
-            )
-
-    def _save_global_token_statistics(self):
-        path = self._output_dir / f"horizon{self._artifact_horizon}.csv"
-        wrote_header = False
-        for frame in self._global_token_statistic_frames():
-            if frame.empty:
-                continue
-            frame.to_csv(
-                path,
-                mode="w" if not wrote_header else "a",
-                header=not wrote_header,
-                index=False,
-            )
-            wrote_header = True
-
-    def _save_routing_visualizations(self, frame, metadata):
-        if frame.empty:
-            return
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        source_names = list(metadata["source_names"])
-        target_names = list(metadata["target_names"])
-        mean_matrix = frame.to_numpy()
-        prefix = f"horizon{self._artifact_horizon}"
-        finite_values = np.abs(mean_matrix[np.isfinite(mean_matrix)])
-        if finite_values.size == 0:
-            return
-        limit = finite_values.max()
-        if limit == 0:
-            limit = np.finfo(np.float64).eps
+        figure, axes = plt.subplots(2, 2, figsize=(14, 9))
+        for column, label in (
+            ("intra_channel_update_ratio", "Intra channel"),
+            ("intra_patch_update_ratio", "Intra patch"),
+            ("inter_channel_update_ratio", "Inter channel"),
+        ):
+            axes[0, 0].plot(
+                frame["round"], frame[column], marker="o", label=label
+            )
+        axes[0, 0].set_title("Relative update by round")
+        axes[0, 0].set_xlabel("Round")
+        axes[0, 0].set_xticks(frame["round"])
+        axes[0, 0].legend()
 
-        figure, axis = plt.subplots(figsize=(14, 8))
-        color_map = plt.get_cmap("coolwarm").copy()
-        color_map.set_bad(color="#d9d9d9")
-        image = axis.imshow(
-            np.ma.masked_invalid(mean_matrix), aspect="auto",
-            vmin=-limit, vmax=limit, cmap=color_map
+        axes[0, 1].plot(
+            frame["round"], frame["channel_pair_cosine_before_inter"],
+            marker="o", label="Before inter attention"
         )
-        axis.set_xticks(np.arange(len(source_names)), source_names, rotation=45,
-                        ha="right")
-        axis.set_yticks(np.arange(len(target_names)), target_names)
-        axis.set_xlabel("Source branch")
-        axis.set_ylabel("Target branch")
-        axis.set_title("Mean Deviation-from-Uniform Routing Heatmap")
-        figure.colorbar(
-            image, ax=axis, label="Mean routing weight minus uniform weight"
+        axes[0, 1].plot(
+            frame["round"], frame["channel_pair_cosine"], marker="o",
+            label="After inter attention"
         )
+        axes[0, 1].set_title("Cross-variable channel cosine")
+        axes[0, 1].set_xlabel("Round")
+        axes[0, 1].set_xticks(frame["round"])
+        axes[0, 1].legend()
+
+        axes[1, 0].plot(
+            frame["round"],
+            frame["within_variable_patch_cosine_before_intra"],
+            marker="o", linestyle="--", label="Within before"
+        )
+        axes[1, 0].plot(
+            frame["round"], frame["within_variable_patch_cosine"],
+            marker="o", label="Within after"
+        )
+        axes[1, 0].plot(
+            frame["round"],
+            frame["between_variable_patch_cosine_before_intra"],
+            marker="o", linestyle="--", label="Between before"
+        )
+        axes[1, 0].plot(
+            frame["round"], frame["between_variable_patch_cosine"],
+            marker="o", label="Between after"
+        )
+        axes[1, 0].set_title("Patch-token cosine")
+        axes[1, 0].set_xlabel("Round")
+        axes[1, 0].set_xticks(frame["round"])
+        axes[1, 0].legend()
+
+        final = frame.iloc[-1]
+        axes[1, 1].bar(
+            ["Correction RMS", "Correction / patch RMS"],
+            [final["correction_rms"],
+             final["correction_to_patch_rms_ratio"]]
+        )
+        axes[1, 1].set_title("Final correction strength")
+        axes[1, 1].tick_params(axis="x", rotation=15)
         figure.tight_layout()
-        figure.savefig(
-            self._output_dir / f"{prefix}_routing_deviation_heatmap.png",
-            dpi=200
-        )
+        figure.savefig(self._output_dir / f"{prefix}.png", dpi=180)
         plt.close(figure)
 
-    def _save_routing_artifacts(self, include_visualizations=False):
-        if self._output_dir is None or self.model is None:
-            return
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        prefix = f"horizon{self._artifact_horizon}"
-        learning_columns = [
-            "epoch", "target_branch", "query_norm", "routing_deviation",
-            "normalized_entropy", "token_routing_variation",
-            "correction_ratio", "val_loss"
-        ]
-        pd.DataFrame(
-            self._routing_learning_rows, columns=learning_columns
-        ).to_csv(
-            self._output_dir / f"{prefix}_routing_learning.csv", index=False
-        )
-        frame, metadata = self._routing_deviation_frame()
-        if not frame.empty:
-            frame.to_csv(
-                self._output_dir / f"{prefix}_routing_deviation.csv"
-            )
-        if include_visualizations and not frame.empty:
-            self._save_routing_visualizations(frame, metadata)
-        self._save_global_token_statistics()
-
     def forecast(self, horizon, series, *, covariates=None):
-        self._reset_global_test_collection()
-        self._global_test_batch_active = False
-        self._artifact_horizon = horizon
-        self._set_routing_statistics_mode("test")
-        result = super().forecast(
-            horizon, series, covariates=covariates
-        )
-        self._save_routing_artifacts(include_visualizations=True)
+        self._reset_channel_statistics(horizon)
+        self._collect_channel_statistics = True
+        try:
+            result = super().forecast(
+                horizon, series, covariates=covariates
+            )
+        finally:
+            self._collect_channel_statistics = False
+        self._save_channel_statistics()
         return result
 
     def batch_forecast(self, horizon, batch_maker, **kwargs):
         new_collection = (
-            not self._global_test_batch_active
-            or self._artifact_horizon != horizon
+            not self._channel_statistics_batch_active
+            or self._channel_statistics_horizon != horizon
         )
-        self._artifact_horizon = horizon
         if new_collection:
-            self._reset_global_test_collection()
-            self._global_test_batch_active = True
-        self._set_routing_statistics_mode("test")
-        result = super().batch_forecast(horizon, batch_maker, **kwargs)
+            self._reset_channel_statistics(horizon)
+            self._channel_statistics_batch_active = True
+        self._collect_channel_statistics = True
+        try:
+            result = super().batch_forecast(horizon, batch_maker, **kwargs)
+        finally:
+            self._collect_channel_statistics = False
         has_more_batches = getattr(batch_maker, "has_more_batches", None)
         if has_more_batches is None or not has_more_batches():
-            self._save_routing_artifacts(include_visualizations=True)
-            self._global_test_batch_active = False
+            self._save_channel_statistics()
+            self._channel_statistics_batch_active = False
         return result
 
     # 执行一次 forward，并按 TFB 约定封装预测结果。
@@ -809,11 +754,34 @@ class VisionTS(DeepForecastingModelBase):
     # 输入 shape：input [B, S, V]，target [B, label_len+H, V]。
     # mark shape：input_mark [B, S, M]，target_mark [B, label_len+H, M]。
     def _process(self, input, target, input_mark, target_mark):
-        # 仅使用 input tensor；返回 output tensor 的 shape 为 [B, H, V]。
+        separate_losses = self.model.training and torch.is_grad_enabled()
+        result = self.model(
+            input,
+            fp64=self.config.fp64,
+            use_variable_chunk=self.config.use_variable_chunk,
+            return_statistics=self._collect_channel_statistics,
+            return_branches=separate_losses,
+        )
+        if self._collect_channel_statistics:
+            output, statistics = result
+            self._accumulate_channel_statistics(statistics)
+            return {"output": output}
+        if not separate_losses:
+            return {"output": result}
+        target = target[
+            :, -self.config.horizon:, :self._series_dim
+        ]
+        channel, processed_target = self._post_process(
+            result["channel"][:, :, :self._series_dim], target
+        )
+        tp, _ = self._post_process(
+            result["tp"][:, :, :self._series_dim], target
+        )
+        gate = torch.sigmoid(self._core_model().fusion_logit)
+        gate_prediction = gate * channel.detach() + (1 - gate) * tp.detach()
+        tp_loss = torch.mean((tp - processed_target) ** 2)
+        gate_loss = torch.mean((gate_prediction - processed_target) ** 2)
         return {
-            "output": self.model(
-                input,
-                fp64=self.config.fp64,
-                use_variable_chunk=self.config.use_variable_chunk,
-            )
+            "output": result["channel"],
+            "additional_loss": tp_loss + gate_loss,
         }

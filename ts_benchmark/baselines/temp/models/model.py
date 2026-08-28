@@ -1,15 +1,16 @@
 # 导入 PyTorch 以创建 tensor 并加载 model weight。
 import torch
-# 导入数学函数，用于按当前可访问 source 数量归一化 routing entropy。
-import math
 
 # 导入路径工具以定位 pretrained checkpoint。
 from pathlib import Path
 
 # 导入 MAE 模型构建函数。
 from . import models_mae
-# 导入 Global Token adapter，用于提取并广播真实 patch 的公共成分。
-from ..layers.latent_adapter import VariableAwareLatentAdapter
+# 导入 channel-token adapter。
+from ..layers.latent_adapter import (
+    TemporalPeriodicAdapter,
+    VariableAwareLatentAdapter,
+)
 # 导入 einops 以执行 tensor 维度变换。
 import einops
 # 导入 PyTorch 函数接口以填充 tensor。
@@ -34,309 +35,16 @@ MAE_ARCH = {
 }
 
 
-# 图片步骤 6～11：为 Block 6～12 的每个 Attention/MLP target 执行逐 token 深度路由。
-class CrossDepthResidualRouter(nn.Module):
-    # 16 个 raw residual source 按 B5-A、B5-M、…、B12-A、B12-M 排列。
-    source_names = tuple(
-        f"B{block}-{branch}"
-        for block in range(5, 13)
-        for branch in ("A", "M")
-    )
-    # Block 5 只提供 source，因此 14 个 routing target 从 B6-A 开始。
-    target_names = source_names[2:]
-
-    # 初始化步骤 8 的 14 条 pseudo-query，以及训练/测试所需的在线统计累计量。
-    def __init__(self, embed_dim):
-        # 初始化 Router 的 nn.Module 状态。
-        super().__init__()
-        # 图片步骤 8：每个 target 各有一条 query；同一 target 内所有 patch 共用它，14 条均从 0 初始化。
-        self.queries = nn.Parameter(torch.zeros(14, embed_dim))
-        # 显式区分训练、验证和测试，验证 forward 不写入任何 routing 累计量。
-        self.statistics_mode = "train"
-        # 按 target 累计训练期 routing 相对 uniform 的绝对偏离总和。
-        self.register_buffer(
-            "_learning_deviation_sum", torch.zeros(14, dtype=torch.float64),
-            persistent=False
-        )
-        # 按 target 累计训练期 normalized entropy 总和。
-        self.register_buffer(
-            "_learning_entropy_sum", torch.zeros(14, dtype=torch.float64),
-            persistent=False
-        )
-        # 按 target 累计同一样本不同真实 patch 的 routing variation。
-        self.register_buffer(
-            "_learning_variation_sum", torch.zeros(14, dtype=torch.float64),
-            persistent=False
-        )
-        # 按 target 累计 correction norm 相对当前 frozen branch 输出 norm 的比例。
-        self.register_buffer(
-            "_learning_correction_ratio_sum",
-            torch.zeros(14, dtype=torch.float64), persistent=False
-        )
-        # 保存各 target 已统计的真实 patch token 数，供逐 token 指标求平均。
-        self.register_buffer(
-            "_learning_token_count", torch.zeros(14, dtype=torch.float64),
-            persistent=False
-        )
-        # 保存各 target 已统计的原始样本数，供 token routing variation 求平均。
-        self.register_buffer(
-            "_learning_sample_count", torch.zeros(14, dtype=torch.float64),
-            persistent=False
-        )
-        # 测试期只在线累计 14×16 target-source routing weight 总和，不保存逐样本数据。
-        self.register_buffer(
-            "_test_routing_sum", torch.zeros(14, 16, dtype=torch.float64),
-            persistent=False
-        )
-        # 为 14 个 target 分别记录参与测试汇总的真实 patch token 数。
-        self.register_buffer(
-            "_test_token_count", torch.zeros(14, dtype=torch.float64),
-            persistent=False
-        )
-        # 分块训练时跨 variable chunk 暂存每个样本的 routing 一、二阶矩。
-        self._chunk_weight_sum = None
-        self._chunk_weight_square_sum = None
-        self._chunk_token_count = None
-
-    # 一个训练 epoch 写出统计后清零六个学习累计量，下一 epoch 独立重新统计。
-    def _reset_learning_statistics(self):
-        self._learning_deviation_sum.zero_()
-        self._learning_entropy_sum.zero_()
-        self._learning_variation_sum.zero_()
-        # correction、token 数和 sample 数与前三项在同一 epoch 边界一起重置。
-        self._learning_correction_ratio_sum.zero_()
-        self._learning_token_count.zero_()
-        self._learning_sample_count.zero_()
-
-    # 清零测试矩阵累计量；具体调用由非 test→test 的模式转换控制。
-    def _reset_test_statistics(self):
-        self._test_routing_sum.zero_()
-        self._test_token_count.zero_()
-
-    # 只有从非 test 模式首次进入 test 时才重置，保证所有测试 batch 能共同求平均。
-    def set_statistics_mode(self, mode):
-        if mode == "test" and self.statistics_mode != "test":
-            self._reset_test_statistics()
-        self.statistics_mode = mode
-
-    def begin_variable_chunk_statistics(self):
-        if self.statistics_mode != "train":
-            return
-        self._chunk_weight_sum = [None] * len(self.target_names)
-        self._chunk_weight_square_sum = [None] * len(self.target_names)
-        self._chunk_token_count = [0] * len(self.target_names)
-
-    def end_variable_chunk_statistics(self):
-        if self._chunk_weight_sum is None:
-            return
-        with torch.no_grad():
-            for target_index, weight_sum in enumerate(self._chunk_weight_sum):
-                if weight_sum is None:
-                    continue
-                token_count = self._chunk_token_count[target_index]
-                mean = weight_sum / token_count
-                variance = (
-                    self._chunk_weight_square_sum[target_index] / token_count
-                    - mean.square()
-                ).clamp_min(0)
-                variation = variance.sqrt().mean(dim=-1)
-                self._learning_variation_sum[target_index].add_(
-                    variation.sum().to(torch.float64)
-                )
-                self._learning_sample_count[target_index].add_(
-                    weight_sum.shape[0]
-                )
-        self._chunk_weight_sum = None
-        self._chunk_weight_square_sum = None
-        self._chunk_token_count = None
-
-    # 图片步骤 7：只对每个真实 patch 自己的 D 维 source 做无参数 RMSNorm，得到同形状 Key。
-    @staticmethod
-    def make_key(source):
-        # 不跨 patch 求均值/std，不构造 sample-level signature；raw Value 不做此归一化。
-        return F.rms_norm(source, (source.shape[-1],), eps=1e-6)
-
-    # 图片步骤 8～11：当前 target 只比较同一 patch 位置的历史 Key，并返回输入侧 correction。
-    def route(self, target_index, sources, keys):
-        # 当前 target 取自己的 pseudo-query；同一 target 的所有真实 patch 共用这一条 query。
-        query = self.queries[target_index].to(keys[0].dtype)
-        # 图片步骤 9：逐 source 做 query·Key，结果为 [B,N,M]，不除以 sqrt(D)。
-        scores = torch.stack([
-            torch.matmul(key, query)
-            for key in keys
-        ], dim=-1)
-        # 只沿 source/depth 维做 softmax，不进行任何 patch-to-patch attention。
-        routing_weights = torch.softmax(scores, dim=-1)
-        # 用同形状零 logits 构造当前 M 个 source 的严格 uniform routing。softmax=[1/M,1/M, ... ,1/M]
-        uniform_weights = torch.softmax(torch.zeros_like(scores), dim=-1)
-        # 图片步骤 11：learned-uniform 系数在 query 为 0 时严格为 0，不乘固定或可学习 scale。
-        coefficients = (routing_weights - uniform_weights).to(sources[0].dtype)
-        # 图片步骤 10：先创建一个全零 correction：correction.shape = [B, N, 768].用于累计所有历史 source 对当前 target 的 depth correction。
-        correction = torch.zeros_like(sources[0])
-        # coefficients[:, :, source_index] 原本形状是：[B, N].增加 None 后变成：[B, N, 1].
-        # source.shape = [B, N, 768]. 乘法广播
-        for source_index, source in enumerate(sources):
-            correction = correction + (
-                coefficients[:, :, source_index, None] * source
-            )
-        # 当前 frozen branch 尚未执行，因此同时返回 weights，待其输出产生后再记录统计。
-        # 返回 [B,N,D] correction；encoder 仅把它加到当前 sublayer 的输入侧。
-        # N = V * P
-        return correction, routing_weights
-
-    # 在线累计图片要求的训练学习指标或测试 deviation 矩阵，不保存逐样本、逐 patch 明细。
-    def record_statistics(
-        self, target_index, routing_weights, correction, target
-    ):
-        # validation 模式直接跳过，防止验证 routing 混入训练 epoch 或测试统计。
-        if self.statistics_mode not in {"train", "test"}:
-            return
-        # 诊断统计不保留计算图，也不参与 forecasting loss 的反向传播。
-        with torch.no_grad():
-            # routing_weights 为 [B,N,M]；B×N 是当前 target 的有效真实 token 数。
-            weights = routing_weights.detach().float()
-            token_count = weights.shape[0] * weights.shape[1]
-            # 测试期只累加每个 target-source 的权重和及有效 token 数。
-            if self.statistics_mode == "test":
-                source_count = weights.shape[-1]
-                # 仅写入当前 target 可访问的 source 前缀，未来 source 保持未统计状态。
-                self._test_routing_sum[
-                    target_index, :source_count
-                ].add_(weights.sum(dim=(0, 1)).to(torch.float64))
-                # 累加有效真实 patch token 数后结束本次 test 统计分支。
-                self._test_token_count[target_index].add_(token_count)
-                return
-            # 训练期的 deviation 使用 mean(|w-1/M|)，避免 signed deviation 沿 source 相消。
-            source_count = weights.shape[-1]
-            uniform = 1.0 / source_count
-            # normalized entropy 除以 log(M)，uniform routing 对应 1。
-            entropy = -(
-                weights * weights.clamp_min(1e-12).log()
-            ).sum(dim=-1) / math.log(source_count)
-            chunk_statistics = self._chunk_weight_sum is not None
-            if chunk_statistics:
-                # 用 float64 汇总一、二阶矩，避免接近 uniform 时
-                # E[w^2]-E[w]^2 在跨块合并中发生明显消减误差。
-                moment_weights = weights.to(torch.float64)
-                weight_sum = moment_weights.sum(dim=1)
-                weight_square_sum = moment_weights.square().sum(dim=1)
-                if self._chunk_weight_sum[target_index] is None:
-                    self._chunk_weight_sum[target_index] = weight_sum
-                    self._chunk_weight_square_sum[
-                        target_index
-                    ] = weight_square_sum
-                else:
-                    self._chunk_weight_sum[target_index].add_(weight_sum)
-                    self._chunk_weight_square_sum[target_index].add_(
-                        weight_square_sum
-                    )
-                self._chunk_token_count[target_index] += weights.shape[1]
-            else:
-                # 对同一样本沿真实 token 维求 population std，再对 source 求平均。
-                variation = weights.std(
-                    dim=1, unbiased=False
-                ).mean(dim=-1)
-            # 逐 token 比较实际 correction 与当前 frozen Attention/MLP raw 输出的 L2 norm。
-            correction_ratio = correction.detach().float().norm(dim=-1) / (
-                target.detach().float().norm(dim=-1) + 1e-12
-            )
-            # 累计 deviation；epoch 结束后再除以 token_count×source_count。
-            self._learning_deviation_sum[target_index].add_(
-                (weights - uniform).abs().sum().to(torch.float64)
-            )
-            # 累计 normalized entropy，epoch 结束后按真实 token 数求平均。
-            self._learning_entropy_sum[target_index].add_(
-                entropy.sum().to(torch.float64)
-            )
-            # 非分块路径维持原有逐 batch variation；分块路径在全部块结束后汇总。
-            if not chunk_statistics:
-                self._learning_variation_sum[target_index].add_(
-                    variation.sum().to(torch.float64)
-                )
-            # 累计 correction ratio，epoch 结束后按真实 token 数求平均。
-            self._learning_correction_ratio_sum[target_index].add_(
-                correction_ratio.sum().to(torch.float64)
-            )
-            # 同步更新当前 target 的 token 与样本计数。
-            self._learning_token_count[target_index].add_(token_count)
-            if not chunk_statistics:
-                self._learning_sample_count[target_index].add_(
-                    weights.shape[0]
-                )
-
-    # 将一个 epoch 的累计量整理为 14 个 target 各一行；epoch/val_loss 由外层补入。
-    def pop_learning_records(self):
-        # 任一 target 尚无训练 token 时不生成不完整的 epoch 记录。
-        if not torch.all(self._learning_token_count > 0):
-            return []
-        # query_norm 用于检查每条零初始化 pseudo-query 是否已经学离 0。
-        query_norms = self.queries.detach().float().norm(dim=-1)
-        # 准备收集当前 epoch 的 14 条 target 记录。
-        rows = []
-        # B6-A 只访问 B5-A/B5-M 两个旧 source，此后每个 target 增加一个可访问 source。
-        for target_index, target_name in enumerate(self.target_names):
-            source_count = target_index + 2
-            token_count = self._learning_token_count[target_index]
-            sample_count = self._learning_sample_count[target_index]
-            # 固定写入当前 target 名称及其 pseudo-query 的 L2 norm。
-            rows.append({
-                "target_branch": target_name,
-                "query_norm": query_norms[target_index].item(),
-                # 对该 target 的全部训练 token 和全部可访问 source 求平均绝对偏离。
-                "routing_deviation": (
-                    self._learning_deviation_sum[target_index]
-                    / (token_count * source_count)
-                ).item(),
-                # normalized entropy 按真实 token 数归一化，uniform routing 对应 1。
-                "normalized_entropy": (
-                    self._learning_entropy_sum[target_index] / token_count
-                ).item(),
-                # token routing variation 先逐样本统计，再按原始样本数归一化。
-                "token_routing_variation": (
-                    self._learning_variation_sum[target_index] / sample_count
-                ).item(),
-                # correction ratio 按真实 token 数归一化，比较输入侧 correction 与当前 raw branch 输出。
-                "correction_ratio": (
-                    self._learning_correction_ratio_sum[target_index]
-                    / token_count
-                ).item(),
-            })
-        # 当前 epoch 的 14 行已完成，清零后由下一轮训练重新累计。
-        self._reset_learning_statistics()
-        return rows
-
-    # 将测试期在线累计量转换为热力图所需的 14×16 mean deviation-from-uniform 矩阵。
-    def test_deviation_matrix(self):
-        # 任一 target 未看到测试 token 时返回空结果，避免输出不完整矩阵。
-        if not torch.all(self._test_token_count > 0):
-            return None
-        # 未来不可访问的 source 预填 NaN，保存 CSV 和绘图时均作为 mask。
-        matrix = torch.full(
-            (14, 16), float("nan"), dtype=torch.float64,
-            device=self._test_routing_sum.device
-        )
-        # 每个有效位置先对全部测试样本/真实 patch 求 mean weight，再减对应 1/M。
-        for target_index in range(14):
-            source_count = target_index + 2
-            # 只填写当前 target 可访问的 source 前缀；其余位置继续保持 NaN mask。
-            matrix[target_index, :source_count] = (
-                self._test_routing_sum[target_index, :source_count]
-                / self._test_token_count[target_index]
-                - 1.0 / source_count
-            )
-        # 0/正/负分别表示无深度偏好、额外选择及相对抑制；不保留逐 token 数据。
-        return matrix.cpu()
-
-
 # 定义使用视觉 MAE backbone 与跨变量 adapter 进行时间序列预测的主模型。
 class VisionTS(nn.Module):
 
     # 分块大小固定为 64；是否启用由外层配置决定，不把大小暴露为超参数。
-    variable_chunk_size = 64
+    variable_chunk_size = 32
 
-    # 初始化视觉 backbone、pretrained checkpoint 和 Global Token adapter。
+    # 初始化视觉 backbone、pretrained checkpoint 和 channel-token adapter。
     def __init__(self, arch='mae_base', ckpt_path=None, load_ckpt=True,
-                 num_latents=1, latent_dim=192, adapter_num_heads=4):
+                 num_latents=1, latent_dim=192, adapter_num_heads=4,
+                 channel_depth=1):
         # 调用 nn.Module 的初始化逻辑。
         super(VisionTS, self).__init__()
 
@@ -344,6 +52,9 @@ class VisionTS(nn.Module):
         if arch not in MAE_ARCH:
             # 说明非法架构名及可用选项。
             raise ValueError(f"Unknown arch: {arch}. Should be in {list(MAE_ARCH.keys())}")
+        if not isinstance(channel_depth, int) or isinstance(channel_depth, bool) \
+                or channel_depth < 1:
+            raise ValueError("channel_depth must be a positive integer.")
 
         # 调用对应构建函数创建 MAE 视觉 backbone。
         self.vision_model = MAE_ARCH[arch][0]()
@@ -372,22 +83,19 @@ class VisionTS(nn.Module):
             # 关闭每个 backbone 参数的梯度计算。
             param.requires_grad = False
 
-        # 图片步骤 1：Global Token 只提取并向真实 patch 广播公共成分，原功能保持不变。
+        # 创建 channel-token adapter。
         self.variable_adapter = VariableAwareLatentAdapter(
             # 使 adapter 输入维度与 MAE positional embedding 维度一致。
             embed_dim=self.vision_model.pos_embed.shape[-1],
-            # 设置可学习 Global Token 数量，当前默认值为 1。
+            # 设置每个变量的 channel token 数量。
             num_latents=num_latents,
             # 设置每个 latent 的特征维度。
             latent_dim=latent_dim,
             # 设置 adapter 的 attention head 数。
             num_heads=adapter_num_heads,
+            channel_depth=channel_depth,
         )
-        # 图片步骤 8：Router 位于 frozen MAE 外部；Router 内唯一新增的可学习参数是 14 条 query。
-        self.residual_router = CrossDepthResidualRouter(
-            self.vision_model.pos_embed.shape[-1]
-        )
-
+        self.fusion_logit = nn.Parameter(torch.zeros(()))
     # 根据序列长度和周期更新图像化、对齐与 mask 配置。
     def update_config(self, context_len, pred_len, periodicity=1, norm_const=0.4, align_const=0.4, interpolation='bilinear'):
         # 读取 MAE 期望的方形图像边长。
@@ -458,6 +166,19 @@ class VisionTS(nn.Module):
         self.register_buffer("mask", mask.float().reshape((1, -1)))
         # 记录 mask 中待重建 patch 所占的比例。
         self.mask_ratio = torch.mean(mask).item()
+        if self.num_patch != 14 or len(self.vision_model.blocks) != 12:
+            raise ValueError("Temporal-periodic branch requires mae_base geometry.")
+        self.temporal_periodic_adapters = nn.ModuleList([
+            TemporalPeriodicAdapter(
+                embed_dim=self.vision_model.pos_embed.shape[-1],
+                bottleneck_dim=64,
+                num_heads=4,
+                num_rows=14,
+                num_columns=self.num_patch_input,
+            )
+            for _ in range(3)
+        ])
+        self.tp_residual_logits = nn.Parameter(torch.full((12,), -2.944))
 
     def _normalize_series(self, x, fp64=False):
         means = x.mean(1, keepdim=True).detach()
@@ -493,12 +214,18 @@ class VisionTS(nn.Module):
         )
 
     def _shared_mask_noise(self):
-        # 先固定当前 0/1 mask 的唯一 permutation，再用无并列 rank 供所有块复用。
         ids_shuffle = torch.argsort(self.mask, dim=1)
         ranks = torch.arange(
             self.mask.shape[1], device=self.mask.device, dtype=self.mask.dtype
         ).unsqueeze(0)
         return torch.empty_like(self.mask).scatter_(1, ids_shuffle, ranks)
+
+    def _visible_grid_permutations(self, noise):
+        visible_positions = torch.argsort(noise, dim=1)[
+            :, :self.num_patch * self.num_patch_input
+        ]
+        to_grid = torch.argsort(visible_positions, dim=1)[0]
+        return to_grid, torch.argsort(to_grid)
 
     def _visible_patch_chunk(self, x_enc, noise):
         batch_size, num_variables, _ = x_enc.shape
@@ -512,111 +239,405 @@ class VisionTS(nn.Module):
             batch_size, num_variables, visible.shape[1], visible.shape[2]
         )
 
-    def _variable_memory_sum(self, x_enc, noise):
+    def _channel_token_chunk(self, x_enc, noise, *channel_history):
         visible = self._visible_patch_chunk(x_enc, noise)
-        return self.variable_adapter.project_patch_memory(visible).sum(dim=1)
+        patch_memory = self.variable_adapter.project_patch_memory(visible)
+        for channel_tokens in channel_history:
+            patch_input = patch_memory
+            patch_memory, channel_tokens = (
+                self.variable_adapter.update_variable_tokens(
+                    patch_memory, channel_tokens
+                )
+            )
+        if self.variable_adapter.collect_statistics:
+            with torch.no_grad():
+                normalized_patch_input = F.normalize(
+                    patch_input.detach().float(), dim=-1, eps=1e-12
+                )
+                normalized_patch_output = F.normalize(
+                    patch_memory.detach().float(), dim=-1, eps=1e-12
+                )
+                num_patches = normalized_patch_output.shape[2]
+                patch_input_sum = normalized_patch_input.sum(dim=2)
+                patch_output_sum = normalized_patch_output.sum(dim=2)
+                return (
+                    channel_tokens,
+                    patch_memory.detach().float().sub(
+                        patch_input.detach().float()
+                    ).square().sum(),
+                    patch_input.detach().float().square().sum(),
+                    patch_memory.detach().float().square().sum(),
+                    visible.detach().float().square().sum(),
+                    visible.new_tensor(visible.numel(), dtype=torch.float32),
+                    (
+                        patch_input_sum.square().sum(dim=-1) - num_patches
+                    ).sum(),
+                    (
+                        patch_output_sum.square().sum(dim=-1) - num_patches
+                    ).sum(),
+                    visible.new_tensor(
+                        normalized_patch_output.shape[0]
+                        * normalized_patch_output.shape[1]
+                        * num_patches * (num_patches - 1),
+                        dtype=torch.float32
+                    ),
+                    normalized_patch_input.sum(dim=1),
+                    normalized_patch_output.sum(dim=1),
+                )
+        return channel_tokens
 
     def prepare_variable_chunk_context(self, x, fp64=False):
         x_enc, means, stdev = self._normalize_series(x, fp64=fp64)
         num_variables = x_enc.shape[1]
         noise = self._shared_mask_noise()
-        memory_sum = None
-        for start in range(0, num_variables, self.variable_chunk_size):
-            end = min(start + self.variable_chunk_size, num_variables)
-            variable_chunk = x_enc[:, start:end, :]
-            if self.training and torch.is_grad_enabled():
-                chunk_sum = checkpoint(
-                    self._variable_memory_sum,
-                    variable_chunk,
-                    noise,
-                    use_reentrant=False,
-                )
-            else:
-                chunk_sum = self._variable_memory_sum(
-                    variable_chunk, noise
-                )
-            memory_sum = (
-                chunk_sum if memory_sum is None else memory_sum + chunk_sum
+        channel_history = [
+            self.variable_adapter.initial_channel_tokens(
+                x_enc.shape[0], num_variables
             )
-
-        mean_patch_memory = memory_sum / num_variables
-        correction = self.variable_adapter.correction_from_mean_memory(
-            mean_patch_memory, num_variables
-        )
+        ]
+        statistics = []
+        for _ in range(self.variable_adapter.channel_depth):
+            token_chunks = []
+            patch_delta_square = 0
+            patch_input_square = 0
+            patch_output_square = 0
+            reference_square = 0
+            reference_count = 0
+            within_patch_input_cosine_sum = 0
+            within_patch_output_cosine_sum = 0
+            within_patch_cosine_count = 0
+            between_patch_input_token_sum = None
+            between_patch_output_token_sum = None
+            for start in range(0, num_variables, self.variable_chunk_size):
+                end = min(start + self.variable_chunk_size, num_variables)
+                variable_chunk = x_enc[:, start:end, :]
+                history_chunk = [
+                    channel_tokens[:, start:end, :]
+                    for channel_tokens in channel_history
+                ]
+                if self.training and torch.is_grad_enabled():
+                    token_chunk = checkpoint(
+                        self._channel_token_chunk,
+                        variable_chunk,
+                        noise,
+                        *history_chunk,
+                        use_reentrant=False,
+                    )
+                else:
+                    token_chunk = self._channel_token_chunk(
+                        variable_chunk, noise, *history_chunk
+                    )
+                if self.variable_adapter.collect_statistics:
+                    (
+                        token_chunk, patch_delta, patch_input, patch_output,
+                        visible_square, visible_count, within_patch_input_sum,
+                        within_patch_output_sum, within_patch_count,
+                        between_patch_input_sum, between_patch_output_sum
+                    ) = token_chunk
+                    patch_delta_square = patch_delta_square + patch_delta
+                    patch_input_square = patch_input_square + patch_input
+                    patch_output_square = patch_output_square + patch_output
+                    reference_square = reference_square + visible_square
+                    reference_count = reference_count + visible_count
+                    within_patch_input_cosine_sum = (
+                        within_patch_input_cosine_sum
+                        + within_patch_input_sum
+                    )
+                    within_patch_output_cosine_sum = (
+                        within_patch_output_cosine_sum
+                        + within_patch_output_sum
+                    )
+                    within_patch_cosine_count = (
+                        within_patch_cosine_count + within_patch_count
+                    )
+                    between_patch_input_token_sum = (
+                        between_patch_input_sum
+                        if between_patch_input_token_sum is None
+                        else between_patch_input_token_sum
+                        + between_patch_input_sum
+                    )
+                    between_patch_output_token_sum = (
+                        between_patch_output_sum
+                        if between_patch_output_token_sum is None
+                        else between_patch_output_token_sum
+                        + between_patch_output_sum
+                    )
+                token_chunks.append(token_chunk)
+            channel_local = torch.cat(token_chunks, dim=1)
+            channel_tokens = self.variable_adapter.mix_channel_tokens(
+                channel_local
+            )
+            if self.variable_adapter.collect_statistics:
+                statistics.append(
+                    self.variable_adapter.round_statistics(
+                        channel_history[-1], channel_local, channel_tokens,
+                        patch_ratio=(
+                            patch_delta_square.sqrt()
+                            / (
+                                torch.maximum(
+                                    patch_input_square.sqrt(),
+                                    patch_output_square.sqrt()
+                                ) + 1e-12
+                            )
+                        ),
+                        patch_input_cosines=(
+                            torch.where(
+                                within_patch_cosine_count > 0,
+                                within_patch_input_cosine_sum
+                                / within_patch_cosine_count.clamp_min(1),
+                                within_patch_input_cosine_sum.new_tensor(1.0)
+                            ),
+                            self.variable_adapter.pair_cosine_from_sum(
+                                between_patch_input_token_sum, num_variables
+                            ),
+                        ),
+                        patch_output_cosines=(
+                            torch.where(
+                                within_patch_cosine_count > 0,
+                                within_patch_output_cosine_sum
+                                / within_patch_cosine_count.clamp_min(1),
+                                within_patch_output_cosine_sum.new_tensor(1.0)
+                            ),
+                            self.variable_adapter.pair_cosine_from_sum(
+                                between_patch_output_token_sum, num_variables
+                            ),
+                        )
+                    )
+                )
+            channel_history.append(channel_tokens)
+        correction = self.variable_adapter.shared_correction(channel_tokens)
+        if self.variable_adapter.collect_statistics:
+            self.variable_adapter.latest_statistics = (
+                self.variable_adapter.complete_statistics(
+                    statistics, correction,
+                    reference_rms=(
+                        reference_square / reference_count
+                    ).sqrt()
+                )
+            )
         return {
             "x_enc": x_enc,
             "means": means,
             "stdev": stdev,
             "noise": noise,
+            "grid_permutations": self._visible_grid_permutations(noise),
             "correction": correction,
             "num_variables": num_variables,
         }
 
-    def forward_variable_chunk(
-        self, context, start, end, correction=None, export_image=False
+    def _sequence_with_cls(self, patch_tokens):
+        batch_size, num_variables, num_patches, embed_dim = patch_tokens.shape
+        patches = patch_tokens.reshape(
+            batch_size * num_variables, num_patches, embed_dim
+        )
+        cls_token = self.vision_model.cls_token + self.vision_model.pos_embed[:, :1]
+        return torch.cat((cls_token.expand(patches.shape[0], -1, -1), patches), dim=1)
+
+    def _encode_branches(
+        self, visible, grid_permutations, correction=None,
+        collect_diagnostics=False
     ):
-        x_enc = context["x_enc"][:, start:end, :]
-        batch_size, num_variables, _ = x_enc.shape
-        image_input = self._render_variable_images(x_enc)
         if correction is None:
-            correction = context["correction"]
-        _, prediction, mask = self.vision_model(
-            image_input,
-            mask_ratio=self.mask_ratio,
-            noise=context["noise"].expand(
-                batch_size * num_variables, -1
-            ),
-            variable_adapter=self.variable_adapter,
-            batch_size=batch_size,
-            num_variables=num_variables,
-            residual_router=self.residual_router,
-            variable_correction=correction,
+            channel_patches, correction = self.variable_adapter(
+                visible, return_correction=True
+            )
+        else:
+            channel_patches = self.variable_adapter.apply_correction(
+                visible, correction
+            )
+        channel_latent = self._sequence_with_cls(channel_patches)
+        for block in self.vision_model.blocks:
+            channel_latent = block(channel_latent)
+        channel_latent = self.vision_model.norm(channel_latent)
+
+        tp_latent = self._sequence_with_cls(visible)
+        tp_statistics = []
+        to_grid, from_grid = grid_permutations
+        for layer, block in enumerate(self.vision_model.blocks):
+            tp_latent = block(tp_latent)
+            patches = tp_latent[:, 1:].reshape_as(visible)
+            grid_patches = patches.index_select(2, to_grid)
+            grid_patches, statistics = self.temporal_periodic_adapters[layer // 4](
+                grid_patches,
+                torch.sigmoid(self.tp_residual_logits[layer]),
+                collect_diagnostics,
+            )
+            if collect_diagnostics:
+                tp_statistics.append(statistics)
+            patches = grid_patches.index_select(2, from_grid)
+            tp_latent = torch.cat((
+                tp_latent[:, :1],
+                patches.reshape(tp_latent.shape[0], patches.shape[2], patches.shape[3]),
+            ), dim=1)
+        tp_latent = self.vision_model.norm(tp_latent)
+        return channel_latent, tp_latent, correction, tp_statistics
+
+    def _decode_normalized(
+        self, latent, ids_restore, batch_size, num_variables,
+        return_image=False
+    ):
+        prediction = self.vision_model.forward_decoder(latent, ids_restore)
+        image = self.vision_model.unpatchify(prediction)
+        segments = self.output_resize(image.mean(1, keepdim=True))
+        flattened = einops.rearrange(
+            segments, '(b n) 1 f p -> b (p f) n',
+            b=batch_size, f=self.periodicity
         )
-        image_reconstructed = self.vision_model.unpatchify(prediction)
-        y_grey = torch.mean(image_reconstructed, 1, keepdim=True)
-        y_segmentations = self.output_resize(y_grey)
-        y_flatten = einops.rearrange(
-            y_segmentations,
-            '(b n) 1 f p -> b (p f) n',
-            b=batch_size,
-            f=self.periodicity,
-        )
-        y = y_flatten[
+        normalized = flattened[
             :,
             self.pad_left + self.context_len:
             self.pad_left + self.context_len + self.pred_len,
             :,
         ]
-        y = y * context["stdev"][:, :, start:end]
-        y = y + context["means"][:, :, start:end]
+        if return_image:
+            return normalized, image
+        return normalized
 
-        if not export_image:
-            return y
+    def _channel_diagnostics(self, correction):
+        statistics = self.variable_adapter.latest_statistics
+        result = {}
+        for round_index in range(self.variable_adapter.channel_depth):
+            result[f"channel_q_pre_inter_cos_r{round_index + 1}"] = (
+                statistics[round_index, 3]
+            )
+            result[f"channel_q_post_inter_cos_r{round_index + 1}"] = (
+                statistics[round_index, 4]
+            )
+        result["channel_correction_ratio"] = statistics[-1, 10]
+        result["channel_correction_crossvar_cosine"] = (
+            self.variable_adapter.pair_cosine(correction.squeeze(2))
+        )
+        return result
 
-        mask = mask.detach().unsqueeze(-1).repeat(
-            1, 1, self.vision_model.patch_embed.patch_size[0] ** 2 * 3
-        )
-        mask = self.vision_model.unpatchify(mask)
-        image_reconstructed = (
-            image_input * (1 - mask) + image_reconstructed * mask
-        )
-        green_bg = -torch.ones_like(image_reconstructed) * 2
-        image_input = image_input * (1 - mask) + green_bg * mask
-        image_input = einops.rearrange(
-            image_input, '(b n) c h w -> b n h w c', b=batch_size
-        )
-        image_reconstructed = einops.rearrange(
-            image_reconstructed,
-            '(b n) c h w -> b n h w c',
-            b=batch_size,
-        )
-        return y, image_input, image_reconstructed
+    def _format_tp_diagnostics(self, tp_statistics):
+        result = {}
+        for layer, statistics in enumerate(tp_statistics, 1):
+            prefix = f"tp_block_{layer}"
+            for name in (
+                "raw_patch_cosine", "centered_residual_ratio",
+                "centered_patch_cosine", "temporal_entropy",
+                "periodic_entropy", "raw_correction_ratio", "beta",
+                "applied_correction_ratio", "update_patch_cosine",
+                "before_adapter_cosine", "after_adapter_cosine",
+            ):
+                result[f"{prefix}_{name}"] = statistics[name]
+            for index, value in enumerate(statistics["temporal_mass"]):
+                offset = index - self.num_patch_input + 1
+                label = "0" if offset == 0 else f"{offset:+d}"
+                result[f"{prefix}_temporal_mass_offset_{label}"] = value
+            for offset, value in enumerate(statistics["periodic_mass"]):
+                result[f"{prefix}_periodic_mass_offset_{offset}"] = value
+        return result
 
-    def _forward_variable_chunks(self, x, export_image=False, fp64=False):
+    def _forward_visible(
+        self, visible, ids_restore, grid_permutations, means, stdev,
+        correction=None,
+        collect_diagnostics=False, return_image=False, return_branches=False
+    ):
+        batch_size, num_variables = visible.shape[:2]
+        channel_latent, tp_latent, correction, tp_statistics = (
+            self._encode_branches(
+                visible, grid_permutations, correction=correction,
+                collect_diagnostics=collect_diagnostics
+            )
+        )
+        channel_decoded = self._decode_normalized(
+            channel_latent, ids_restore, batch_size, num_variables,
+            return_image=return_image
+        )
+        tp_decoded = self._decode_normalized(
+            tp_latent, ids_restore, batch_size, num_variables,
+            return_image=return_image
+        )
+        if return_image:
+            channel_normalized, channel_image = channel_decoded
+            tp_normalized, tp_image = tp_decoded
+        else:
+            channel_normalized = channel_decoded
+            tp_normalized = tp_decoded
+        gate = torch.sigmoid(self.fusion_logit)
+        fused_normalized = (
+            gate * channel_normalized + (1 - gate) * tp_normalized
+        )
+        result = {
+            "output": fused_normalized * stdev + means,
+        }
+        if return_branches:
+            result.update({
+                "channel": channel_normalized * stdev + means,
+                "tp": tp_normalized * stdev + means,
+                "channel_normalized": channel_normalized,
+                "tp_normalized": tp_normalized,
+            })
+        if return_image:
+            result["image"] = gate * channel_image + (1 - gate) * tp_image
+        if collect_diagnostics:
+            result["diagnostics"] = {
+                **self._channel_diagnostics(correction),
+                **self._format_tp_diagnostics(tp_statistics),
+            }
+        return result
+
+    def forward_variable_chunk(
+        self, context, start, end, correction=None, export_image=False,
+        return_branches=False, return_diagnostics=False
+    ):
+        x_enc = context["x_enc"][:, start:end, :]
+        batch_size, num_variables, _ = x_enc.shape
+        image_input = self._render_variable_images(x_enc)
+        visible, mask, ids_restore = self.vision_model.prepare_visible_patches(
+            image_input,
+            self.mask_ratio,
+            context["noise"].expand(batch_size * num_variables, -1),
+        )
+        visible = visible.reshape(
+            batch_size, num_variables, visible.shape[1], visible.shape[2]
+        )
+        if correction is None:
+            correction = context["correction"]
+        correction = correction[:, start:end]
+        result = self._forward_visible(
+            visible, ids_restore, context["grid_permutations"],
+            context["means"][:, :, start:end],
+            context["stdev"][:, :, start:end],
+            correction=correction,
+            collect_diagnostics=return_diagnostics,
+            return_image=export_image,
+            return_branches=return_branches or return_diagnostics,
+        )
+        if export_image:
+            mask_image = self.vision_model.unpatchify(
+                mask.detach().unsqueeze(-1).repeat(
+                    1, 1, self.patch_size ** 2 * 3
+                )
+            )
+            reconstructed = (
+                image_input * (1 - mask_image) + result["image"] * mask_image
+            )
+            green_bg = -torch.ones_like(image_input) * 2
+            masked_input = image_input * (1 - mask_image) + green_bg * mask_image
+            result["input_image"] = einops.rearrange(
+                masked_input, '(b n) c h w -> b n h w c', b=batch_size
+            )
+            result["reconstructed_image"] = einops.rearrange(
+                reconstructed, '(b n) c h w -> b n h w c', b=batch_size
+            )
+        if return_branches or return_diagnostics:
+            return result
+        if export_image:
+            return (
+                result["output"], result["input_image"],
+                result["reconstructed_image"]
+            )
+        return result["output"]
+
+    def _forward_variable_chunks(
+        self, x, export_image=False, fp64=False, return_branches=False,
+        return_diagnostics=False
+    ):
         context = self.prepare_variable_chunk_context(x, fp64=fp64)
-        predictions = []
-        input_images = []
-        reconstructed_images = []
+        results = []
+        widths = []
         for start in range(
             0, context["num_variables"], self.variable_chunk_size
         ):
@@ -624,165 +645,113 @@ class VisionTS(nn.Module):
                 start + self.variable_chunk_size,
                 context["num_variables"],
             )
-            result = self.forward_variable_chunk(
-                context, start, end, export_image=export_image
-            )
+            results.append(self.forward_variable_chunk(
+                context, start, end, export_image=export_image,
+                return_branches=return_branches,
+                return_diagnostics=return_diagnostics,
+            ))
+            widths.append(end - start)
+        if not (return_branches or return_diagnostics):
             if export_image:
-                prediction, input_image, reconstructed_image = result
-                predictions.append(prediction)
-                input_images.append(input_image)
-                reconstructed_images.append(reconstructed_image)
-            else:
-                predictions.append(result)
-
-        prediction = torch.cat(predictions, dim=-1)
-        if export_image:
-            return (
-                prediction,
-                torch.cat(input_images, dim=1),
-                torch.cat(reconstructed_images, dim=1),
+                return (
+                    torch.cat([item[0] for item in results], dim=-1),
+                    torch.cat([item[1] for item in results], dim=1),
+                    torch.cat([item[2] for item in results], dim=1),
+                )
+            return torch.cat(results, dim=-1)
+        merged = {
+            name: torch.cat([item[name] for item in results], dim=-1)
+            for name in (
+                "output", "channel", "tp", "channel_normalized",
+                "tp_normalized"
             )
-        return prediction
-
-    # 将时间序列渲染为图像，通过 MAE 重建未来区间并恢复为预测序列。
-    def forward(
-        self, x, export_image=False, fp64=False, use_variable_chunk=False
-    ):
-        # 输入 x 的 shape 为 [B, L_ctx, N]：B 是 batch size，L_ctx 是回看长度，N 是变量数。
-        # fp64=True 可避免比特币等数据集上的数学溢出。
-        # 默认返回 y，shape 为 [B, L_pred, N]，L_pred 是预测长度。
-        # export_image=True 时还返回两个 [B, N, H, W, C] 图像，H/W/C 为高/宽/channel 数。
-        # 中间 shape 中 F 是 periodicity，P_ctx 是历史周期段数，P_all 是重建 image 的周期段数。
-        # L_pad 是左侧填充后的输入长度，L_all=F×P_all 是重建 image 展开后的 sequence 长度。
-
-        if use_variable_chunk:
-            return self._forward_variable_chunks(
-                x, export_image=export_image, fp64=fp64
-            )
-
-        # 1. 计算并切断每个样本、每个变量的时间维均值。
-        means = x.mean(1, keepdim=True).detach()  # shape：[B, 1, N]。
-        # 从输入中减去均值以进行中心化。
-        x_enc = x - means
-        # 计算每个变量的标准差，fp64 模式使用双精度以提高数值稳定性。
-        stdev = torch.sqrt(
-            torch.var(x_enc.to(torch.float64) if fp64 else x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)  # shape：[B, 1, N]。
-        # 用配置常数调整标准差，从而控制归一化后的幅度。
-        stdev /= self.norm_const
-        # 用调整后的标准差缩放中心化序列。
-        x_enc /= stdev
-        # 将变量维移到时间维之前，使各变量在渲染和 patch embedding 时保持独立。
-        x_enc = einops.rearrange(x_enc, 'b s n -> b n s')  # shape：[B, N, L_ctx]。
-
-        # 2. 复制边界值填充序列左侧，使时间长度能按周期分组。
-        x_pad = F.pad(x_enc, (self.pad_left, 0), mode='replicate')  # shape：[B, N, L_pad]，L_pad 为填充后长度。
-        # 将每个变量按周期折叠成单 channel 二维图像。
-        x_2d = einops.rearrange(x_pad, 'b n (p f) -> (b n) 1 f p', f=self.periodicity)  # shape：[B×N, 1, F, P_ctx]。
-
-        # 3. 将历史图像缩放到预留的输入 patch 区域。
-        x_resize = self.input_resize(x_2d)  # shape：[B×N, 1, H, W_in]。
-        # 创建与预测 patch 等宽的全零待重建区域。
-        masked = torch.zeros((x_2d.shape[0], 1, self.image_size, self.num_patch_output * self.patch_size), device=x_2d.device, dtype=x_2d.dtype)  # shape：[B×N, 1, H, W_out]。
-        # 在水平方向拼接历史图像与待重建区域。
-        x_concat_with_masked = torch.cat([
-            # 放入已知的历史图像。
-            x_resize,
-            # 放入代表未来的空白图像。
-            masked
-        ], dim=-1)  # shape：[B×N, 1, H, W]，W = W_in + W_out。
-        # 将单 channel 序列图复制成 MAE 期望的 3-channel 图像。
-        image_input = einops.repeat(x_concat_with_masked, 'b 1 h w -> b c h w', c=3)  # shape：[B×N, 3, H, W]。
-
-        # 4. 调用 frozen MAE；Global Token 仅提取并向真实 patch 广播公共成分。
-        # 返回 y [B×N, L, p²×3] 和 mask [B×N, L]；L 为 patch 数，p 为 patch 边长。
-        _, y, mask = self.vision_model(
-            # 传入渲染后的 3-channel 图像。
-            image_input,
-            # 指定需要重建的 patch 比例。
-            mask_ratio=self.mask_ratio,
-            # 将固定 mask 复制到当前的所有变量样本。
-            noise=einops.repeat(self.mask, '1 l -> n l', n=image_input.shape[0]),
-            # 传入原有 Global Token adapter；它不承担后续的 source-depth 选择。
-            variable_adapter=self.variable_adapter,
-            # 告知 adapter 原始 batch size。
-            batch_size=x_enc.shape[0],
-            # 告知 adapter 每个样本的变量数。
-            num_variables=x_enc.shape[1],
-            # 图片步骤 2～11：传入逐 token Router；Global Token 与 frozen MAE 其余路径保持不变。
-            residual_router=self.residual_router,
-        )
-        # 将 MAE 输出的 patch 序列还原为完整图像。
-        image_reconstructed = self.vision_model.unpatchify(y)  # shape：[B×N, 3, H, W]。
-
-        # 5. 对重建图像的颜色 channel 取平均，恢复为灰度序列图。
-        y_grey = torch.mean(image_reconstructed, 1, keepdim=True)  # shape：[B×N, 1, H, W]。
-        # 将灰度图缩放回周期分段对应的尺寸。
-        y_segmentations = self.output_resize(y_grey)  # shape：[B×N, 1, F, P_all]。
-        # 将每个变量的二维周期分段展平回一维时间序列。
-        y_flatten = einops.rearrange(
-            # 传入已缩放的重建分段。
-            y_segmentations,
-            # 合并分段位置与周期内位置，并恢复变量维。
-            '(b n) 1 f p -> b (p f) n',
-            # 提供原始 batch size 以拆分合并维。
-            b=x_enc.shape[0], f=self.periodicity
-        )  # shape：[B, L_all, N]，L_all = F×P_all。
-        # 跳过填充和历史部分，截取指定长度的未来预测窗口。
-        y = y_flatten[:, self.pad_left + self.context_len: self.pad_left + self.context_len + self.pred_len, :]  # shape：[B, L_pred, N]。
-
-        # 6. 使用每个变量的标准差恢复原始数值尺度。
-        y = y * (stdev.repeat(1, self.pred_len, 1))
-        # 加回每个变量的均值，完成 denormalization。
-        y = y + (means.repeat(1, self.pred_len, 1))
-
-        # 根据开关决定是否额外导出可视化图像。
-        if export_image:
-            # 切断 mask 与计算图的连接。
-            mask = mask.detach()
-            # 将 patch 级 mask 扩展到每个 patch 的所有 pixel 和三个 channel。
-            mask = mask.unsqueeze(-1).repeat(1, 1, self.vision_model.patch_embed.patch_size[0]**2 *3)  # shape：[B×N, L, p²×3]。
-            # 将 patch mask 还原为 image，1 表示移除，0 表示保留。
-            mask = self.vision_model.unpatchify(mask)  # shape：[B×N, 3, H, W]。
-            # 如需改为 channel 后置布局，可使用下面的维度变换。
-            # mask = torch.einsum('nchw->nhwc', mask)
-            # 保留已知输入区域，并用重建结果覆盖 mask 区域。
-            image_reconstructed = image_input * (1 - mask) + image_reconstructed * mask
-            # 创建数值为 -2 的背景图，用于标记待重建区域。
-            green_bg = -torch.ones_like(image_reconstructed) * 2
-            # 保留已知输入区域，并用背景值替换 mask 区域。
-            image_input = image_input * (1 - mask) + green_bg * mask
-            # 将输入图像拆回 batch 和变量维，同时将 channel 移到末维。
-            image_input = einops.rearrange(image_input, '(b n) c h w -> b n h w c', b=x_enc.shape[0])  # shape：[B, N, H, W, 3]。
-            # 以相同布局整理重建图像，便于可视化。
-            image_reconstructed = einops.rearrange(image_reconstructed, '(b n) c h w -> b n h w c', b=x_enc.shape[0])  # shape：[B, N, H, W, 3]。
-            # 同时返回预测值、mask 后输入图和重建图。
-            return y, image_input, image_reconstructed
-        # 不导出图像时仅返回预测序列。
-        return y
-
-    # 设置路由统计阶段；test 仅在线累计最终 14×16 deviation 矩阵。
-    def set_routing_statistics_mode(self, mode):
-        self.residual_router.set_statistics_mode(mode)
-        self.variable_adapter.set_statistics_mode(mode)
-
-    # 数据完整时弹出并清空一个训练 epoch 的 14 行 routing learning 指标。
-    def pop_routing_learning_records(self):
-        return self.residual_router.pop_learning_records()
-
-    # 返回测试集所有样本、所有真实 patch 聚合后的 mean deviation 矩阵。
-    def routing_deviation_matrix(self):
-        return self.residual_router.test_deviation_matrix()
-
-    # 返回由第一阶段 Global Token softmax attention 导出的测试统计。
-    def global_token_statistics(self):
-        return self.variable_adapter.test_statistics()
-
-    def reset_global_token_statistics(self):
-        self.variable_adapter._reset_test_statistics()
-
-    # 返回热力图横轴 source 和纵轴 target 的固定顺序。
-    def routing_metadata(self):
-        return {
-            "source_names": self.residual_router.source_names,
-            "target_names": self.residual_router.target_names,
         }
+        if export_image:
+            merged["input_image"] = torch.cat(
+                [item["input_image"] for item in results], dim=1
+            )
+            merged["reconstructed_image"] = torch.cat(
+                [item["reconstructed_image"] for item in results], dim=1
+            )
+        if return_diagnostics:
+            diagnostics = self._channel_diagnostics(context["correction"])
+            tp_keys = [
+                key for key in results[0]["diagnostics"]
+                if key.startswith("tp_block_")
+            ]
+            total_width = sum(widths)
+            for key in tp_keys:
+                diagnostics[key] = sum(
+                    item["diagnostics"][key] * width
+                    for item, width in zip(results, widths)
+                ) / total_width
+            merged["diagnostics"] = diagnostics
+        return merged
+
+    def _attach_statistics(self, result, return_statistics):
+        if not return_statistics:
+            return result
+        return result, self.variable_adapter.latest_statistics.unsqueeze(0)
+
+    def forward(
+        self, x, export_image=False, fp64=False, use_variable_chunk=False,
+        return_statistics=False, return_branches=False,
+        return_diagnostics=False
+    ):
+        self.variable_adapter.collect_statistics = (
+            return_statistics or return_diagnostics
+        )
+        self.variable_adapter.latest_statistics = None
+        if use_variable_chunk:
+            result = self._forward_variable_chunks(
+                x, export_image=export_image, fp64=fp64,
+                return_branches=return_branches,
+                return_diagnostics=return_diagnostics,
+            )
+            return self._attach_statistics(result, return_statistics)
+        x_enc, means, stdev = self._normalize_series(x, fp64=fp64)
+        batch_size, num_variables = x_enc.shape[:2]
+        image_input = self._render_variable_images(x_enc)
+        noise = self._shared_mask_noise()
+        visible, mask, ids_restore = self.vision_model.prepare_visible_patches(
+            image_input,
+            self.mask_ratio,
+            noise.expand(batch_size * num_variables, -1),
+        )
+        visible = visible.reshape(
+            batch_size, num_variables, visible.shape[1], visible.shape[2]
+        )
+        result = self._forward_visible(
+            visible, ids_restore, self._visible_grid_permutations(noise),
+            means, stdev,
+            collect_diagnostics=return_diagnostics,
+            return_image=export_image,
+            return_branches=return_branches or return_diagnostics,
+        )
+        if export_image:
+            mask_image = self.vision_model.unpatchify(
+                mask.detach().unsqueeze(-1).repeat(
+                    1, 1, self.patch_size ** 2 * 3
+                )
+            )
+            reconstructed = (
+                image_input * (1 - mask_image) + result["image"] * mask_image
+            )
+            green_bg = -torch.ones_like(image_input) * 2
+            masked_input = image_input * (1 - mask_image) + green_bg * mask_image
+            result["input_image"] = einops.rearrange(
+                masked_input, '(b n) c h w -> b n h w c', b=batch_size
+            )
+            result["reconstructed_image"] = einops.rearrange(
+                reconstructed, '(b n) c h w -> b n h w c', b=batch_size
+            )
+        if return_branches or return_diagnostics:
+            return self._attach_statistics(result, return_statistics)
+        if export_image:
+            output = (
+                result["output"], result["input_image"],
+                result["reconstructed_image"]
+            )
+        else:
+            output = result["output"]
+        return self._attach_statistics(output, return_statistics)
