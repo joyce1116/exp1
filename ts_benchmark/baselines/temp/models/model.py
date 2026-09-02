@@ -54,7 +54,8 @@ class VisionTS(nn.Module):
     # 初始化视觉 backbone、pretrained checkpoint 和 channel-token adapter。
     def __init__(self, arch='mae_base', ckpt_path=None, load_ckpt=True,
                  num_latents=1, latent_dim=192, adapter_num_heads=4,
-                 channel_depth=1, ablation_mode="full"):
+                 channel_depth=1, ablation_mode="full",
+                 tp_bottleneck_dim=64):
         # 调用 nn.Module 的初始化逻辑。
         super(VisionTS, self).__init__()
 
@@ -71,6 +72,7 @@ class VisionTS(nn.Module):
                 f"Should be in {sorted(ABLATION_MODES)}"
             )
         self.ablation_mode = ablation_mode
+        self.tp_bottleneck_dim = tp_bottleneck_dim
         self.use_channel = ablation_mode != "wo_channel"
         self.use_tp = ablation_mode != "wo_tp"
         self.use_centering = ablation_mode != "wo_centering"
@@ -205,7 +207,7 @@ class VisionTS(nn.Module):
         if self.use_tp and self.share_tp:
             self.tp_shared = TemporalPeriodicAdapter(
                 embed_dim=self.vision_model.pos_embed.shape[-1],
-                bottleneck_dim=64,
+                bottleneck_dim=self.tp_bottleneck_dim,
                 num_heads=4,
                 num_rows=14,
                 num_columns=self.num_patch_input,
@@ -217,7 +219,7 @@ class VisionTS(nn.Module):
             self.temporal_periodic_adapters = nn.ModuleList([
                 TemporalPeriodicAdapter(
                     embed_dim=self.vision_model.pos_embed.shape[-1],
-                    bottleneck_dim=64,
+                    bottleneck_dim=self.tp_bottleneck_dim,
                     num_heads=4,
                     num_rows=14,
                     num_columns=self.num_patch_input,

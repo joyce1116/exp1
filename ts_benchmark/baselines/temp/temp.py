@@ -38,6 +38,7 @@ MODEL_HYPER_PARAMS = {
     "num_latents": 1,  # 每个变量使用一个 channel token。
     "latent_dim": 192,  # 设置 latent embedding 的维度。
     "adapter_num_heads": 4,  # 设置 adapter 的 attention head 数量。
+    "tp_bottleneck_dim": 64,  # 设置 TP Adapter 的 bottleneck 维度。
     "channel_depth": 1,
     "ablation_mode": "full",
     "use_variable_chunk": False,  # 是否启用固定 16-variable 的低显存分块流程。
@@ -138,6 +139,7 @@ class VisionTS(DeepForecastingModelBase):
             num_latents=self.config.num_latents,  # 传入每个变量的 channel token 数量。
             latent_dim=self.config.latent_dim,  # 传入 latent embedding 维度。
             adapter_num_heads=self.config.adapter_num_heads,  # 传入 attention head 数量。
+            tp_bottleneck_dim=self.config.tp_bottleneck_dim,
             channel_depth=self.config.channel_depth,
             ablation_mode=self.config.ablation_mode,
         )
