@@ -2,7 +2,7 @@
 
 # 导入 PyTorch tensor 与参数初始化功能。
 import torch
-import math
+# import math  # Disabled attention-entropy diagnostics.
 # 导入神经网络层模块。
 from torch import nn
 from torch.nn import functional as F
@@ -30,8 +30,9 @@ class VariableAwareLatentAdapter(nn.Module):
             raise ValueError("channel_depth must be a positive integer.")
         self.num_latents = num_latents
         self.channel_depth = channel_depth
-        self.collect_statistics = False
-        self.latest_statistics = None
+        # Existing diagnostic-statistics state is intentionally disabled.
+        # self.collect_statistics = False
+        # self.latest_statistics = None
         # 在降维前对输入 patch embedding 执行 LayerNorm。
         self.patch_norm = nn.LayerNorm(embed_dim)
         # 将 patch embedding 从 E 维 projection 到 D 维 latent space。
@@ -106,95 +107,97 @@ class VariableAwareLatentAdapter(nn.Module):
         )[0]
         return self.channel_memory_norm(channel_tokens + update)
 
-    @staticmethod
-    def relative_rms(output, input):
-        with torch.no_grad():
-            output = output.detach().float()
-            input = input.detach().float()
-            output_rms = output.square().mean().sqrt()
-            input_rms = input.square().mean().sqrt()
-            return output.sub(input).square().mean().sqrt() / (
-                torch.maximum(input_rms, output_rms) + 1e-12
-            )
-
-    @staticmethod
-    def pair_cosine(tokens):
-        with torch.no_grad():
-            normalized = F.normalize(
-                tokens.detach().float(), dim=-1, eps=1e-12
-            )
-            num_tokens = normalized.shape[-2]
-            if num_tokens == 1:
-                return normalized.new_tensor(1.0)
-            summed = normalized.sum(dim=-2)
-            diagonal = normalized.square().sum(dim=-1).sum(dim=-1)
-            return (
-                (summed.square().sum(dim=-1) - diagonal)
-                / (num_tokens * (num_tokens - 1))
-            ).mean()
-
-    @classmethod
-    def channel_pair_cosine(cls, channel_tokens):
-        return cls.pair_cosine(channel_tokens)
-
-    @classmethod
-    def patch_pair_cosines(cls, patch_tokens):
-        return (
-            cls.pair_cosine(patch_tokens),
-            cls.pair_cosine(patch_tokens.transpose(1, 2)),
-        )
-
-    @staticmethod
-    def pair_cosine_from_sum(token_sum, num_tokens):
-        with torch.no_grad():
-            if num_tokens == 1:
-                return token_sum.new_tensor(1.0)
-            return (
-                (token_sum.square().sum(dim=-1) - num_tokens)
-                / (num_tokens * (num_tokens - 1))
-            ).mean()
-
-    def round_statistics(
-        self, channel_input, channel_local, channel_mixed,
-        patch_input=None, patch_output=None, patch_ratio=None,
-        patch_input_cosines=None, patch_output_cosines=None
-    ):
-        if patch_ratio is None:
-            patch_ratio = self.relative_rms(patch_output, patch_input)
-        if patch_input_cosines is None:
-            patch_input_cosines = self.patch_pair_cosines(patch_input)
-        if patch_output_cosines is None:
-            patch_output_cosines = self.patch_pair_cosines(patch_output)
-        return torch.stack((
-            self.relative_rms(channel_local, channel_input),
-            patch_ratio,
-            self.relative_rms(channel_mixed, channel_local),
-            self.channel_pair_cosine(channel_local),
-            self.channel_pair_cosine(channel_mixed),
-            patch_input_cosines[0],
-            patch_output_cosines[0],
-            patch_input_cosines[1],
-            patch_output_cosines[1],
-        ))
-
-    def complete_statistics(
-        self, round_statistics, correction, reference=None,
-        reference_rms=None
-    ):
-        with torch.no_grad():
-            correction_rms = correction.detach().float().square().mean().sqrt()
-            if reference_rms is None:
-                reference_rms = (
-                    reference.detach().float().square().mean().sqrt()
-                )
-            result = torch.full(
-                (self.channel_depth, 11), float("nan"),
-                device=correction.device, dtype=torch.float32
-            )
-            result[:, :9] = torch.stack(round_statistics)
-            result[-1, 9] = correction_rms
-            result[-1, 10] = correction_rms / (reference_rms + 1e-12)
-            return result
+    # Existing channel diagnostic metrics are intentionally disabled and
+    # retained as comments.
+    # @staticmethod
+    # def relative_rms(output, input):
+    #     with torch.no_grad():
+    #         output = output.detach().float()
+    #         input = input.detach().float()
+    #         output_rms = output.square().mean().sqrt()
+    #         input_rms = input.square().mean().sqrt()
+    #         return output.sub(input).square().mean().sqrt() / (
+    #             torch.maximum(input_rms, output_rms) + 1e-12
+    #         )
+    #
+    # @staticmethod
+    # def pair_cosine(tokens):
+    #     with torch.no_grad():
+    #         normalized = F.normalize(
+    #             tokens.detach().float(), dim=-1, eps=1e-12
+    #         )
+    #         num_tokens = normalized.shape[-2]
+    #         if num_tokens == 1:
+    #             return normalized.new_tensor(1.0)
+    #         summed = normalized.sum(dim=-2)
+    #         diagonal = normalized.square().sum(dim=-1).sum(dim=-1)
+    #         return (
+    #             (summed.square().sum(dim=-1) - diagonal)
+    #             / (num_tokens * (num_tokens - 1))
+    #         ).mean()
+    #
+    # @classmethod
+    # def channel_pair_cosine(cls, channel_tokens):
+    #     return cls.pair_cosine(channel_tokens)
+    #
+    # @classmethod
+    # def patch_pair_cosines(cls, patch_tokens):
+    #     return (
+    #         cls.pair_cosine(patch_tokens),
+    #         cls.pair_cosine(patch_tokens.transpose(1, 2)),
+    #     )
+    #
+    # @staticmethod
+    # def pair_cosine_from_sum(token_sum, num_tokens):
+    #     with torch.no_grad():
+    #         if num_tokens == 1:
+    #             return token_sum.new_tensor(1.0)
+    #         return (
+    #             (token_sum.square().sum(dim=-1) - num_tokens)
+    #             / (num_tokens * (num_tokens - 1))
+    #         ).mean()
+    #
+    # def round_statistics(
+    #     self, channel_input, channel_local, channel_mixed,
+    #     patch_input=None, patch_output=None, patch_ratio=None,
+    #     patch_input_cosines=None, patch_output_cosines=None
+    # ):
+    #     if patch_ratio is None:
+    #         patch_ratio = self.relative_rms(patch_output, patch_input)
+    #     if patch_input_cosines is None:
+    #         patch_input_cosines = self.patch_pair_cosines(patch_input)
+    #     if patch_output_cosines is None:
+    #         patch_output_cosines = self.patch_pair_cosines(patch_output)
+    #     return torch.stack((
+    #         self.relative_rms(channel_local, channel_input),
+    #         patch_ratio,
+    #         self.relative_rms(channel_mixed, channel_local),
+    #         self.channel_pair_cosine(channel_local),
+    #         self.channel_pair_cosine(channel_mixed),
+    #         patch_input_cosines[0],
+    #         patch_output_cosines[0],
+    #         patch_input_cosines[1],
+    #         patch_output_cosines[1],
+    #     ))
+    #
+    # def complete_statistics(
+    #     self, round_statistics, correction, reference=None,
+    #     reference_rms=None
+    # ):
+    #     with torch.no_grad():
+    #         correction_rms = correction.detach().float().square().mean().sqrt()
+    #         if reference_rms is None:
+    #             reference_rms = (
+    #                 reference.detach().float().square().mean().sqrt()
+    #             )
+    #         result = torch.full(
+    #             (self.channel_depth, 11), float("nan"),
+    #             device=correction.device, dtype=torch.float32
+    #         )
+    #         result[:, :9] = torch.stack(round_statistics)
+    #         result[-1, 9] = correction_rms
+    #         result[-1, 10] = correction_rms / (reference_rms + 1e-12)
+    #         return result
 
     # 每个 channel token 作为对应变量的唯一 K/V，只需执行 V 与 output projection。
     def shared_correction(self, latent_memory):
@@ -231,7 +234,7 @@ class VariableAwareLatentAdapter(nn.Module):
         channel_tokens = self.initial_channel_tokens(
             batch_size, num_variables
         )
-        statistics = []
+        # statistics = []  # Disabled channel diagnostics.
         for _ in range(self.channel_depth):
             patch_input = patch_memory
             channel_input = channel_tokens
@@ -240,13 +243,13 @@ class VariableAwareLatentAdapter(nn.Module):
             )
             channel_local = channel_tokens
             channel_tokens = self.mix_channel_tokens(channel_local)
-            if self.collect_statistics:
-                statistics.append(self.round_statistics(
-                    channel_input, channel_local, channel_tokens,
-                    patch_input=patch_input, patch_output=patch_memory
-                ))
+            # if self.collect_statistics:
+            #     statistics.append(self.round_statistics(
+            #         channel_input, channel_local, channel_tokens,
+            #         patch_input=patch_input, patch_output=patch_memory
+            #     ))
         correction = self.shared_correction(channel_tokens)
-        return correction, statistics
+        return correction, None
 
     @staticmethod
     def apply_correction(patch_tokens, correction):
@@ -258,13 +261,13 @@ class VariableAwareLatentAdapter(nn.Module):
     def forward(self, patch_tokens, return_correction=False):
         # 从输入 shape [B, V, P, E] 中读取各维度大小。
         batch_size, num_variables, num_patches, embed_dim = patch_tokens.shape
-        self.latest_statistics = None
+        # self.latest_statistics = None
         patch_memory = self.project_patch_memory(patch_tokens)
         correction, statistics = self.correction_from_patch_memory(patch_memory)
-        if self.collect_statistics:
-            self.latest_statistics = self.complete_statistics(
-                statistics, correction, reference=patch_tokens
-            )
+        # if self.collect_statistics:
+        #     self.latest_statistics = self.complete_statistics(
+        #         statistics, correction, reference=patch_tokens
+        #     )
         output = self.apply_correction(patch_tokens, correction)
         if return_correction:
             return output, correction
@@ -305,46 +308,64 @@ class RelativePositionAttention(nn.Module):
             x.shape[0], length, dim
         )
         output = self.out_proj(output).reshape(*leading_shape, length, dim)
-        if not collect_statistics:
-            return output, None
-        with torch.no_grad():
-            probabilities = weights.detach().float()
-            if length > 1:
-                entropy = -(
-                    probabilities * probabilities.clamp_min(1e-12).log()
-                ).sum(dim=-1).mean() / math.log(length)
-            else:
-                entropy = probabilities.new_tensor(0.0)
-            masses = torch.stack([
-                probabilities[..., bias_index == offset].sum()
-                for offset in range(self.relative_bias.shape[1])
-            ])
-            masses = masses / probabilities.sum().clamp_min(1e-12)
-        return output, (entropy, masses)
+        return output, None
+
+        # Existing attention entropy/offset-mass diagnostics are intentionally
+        # disabled and retained as comments.
+        # if not collect_statistics:
+        #     return output, None
+        # with torch.no_grad():
+        #     probabilities = weights.detach().float()
+        #     if length > 1:
+        #         entropy = -(
+        #             probabilities * probabilities.clamp_min(1e-12).log()
+        #         ).sum(dim=-1).mean() / math.log(length)
+        #     else:
+        #         entropy = probabilities.new_tensor(0.0)
+        #     masses = torch.stack([
+        #         probabilities[..., bias_index == offset].sum()
+        #         for offset in range(self.relative_bias.shape[1])
+        #     ])
+        #     masses = masses / probabilities.sum().clamp_min(1e-12)
+        # return output, (entropy, masses)
 
 
 class TemporalPeriodicAdapter(nn.Module):
     def __init__(
         self, embed_dim=768, bottleneck_dim=64, num_heads=4,
-        num_rows=14, num_columns=1
+        num_rows=14, num_columns=1, center=True,
+        interaction_mode="axis_attention",
     ):
         super().__init__()
+        if interaction_mode not in {
+            "axis_attention", "global_attention", "axis_mean"
+        }:
+            raise ValueError(f"Unknown TP interaction mode: {interaction_mode}")
         self.num_rows = num_rows
         self.num_columns = num_columns
+        self.center = center
+        self.interaction_mode = interaction_mode
         self.center_norm = nn.LayerNorm(embed_dim)
         self.down = nn.Linear(embed_dim, bottleneck_dim)
-        self.temporal_attention = RelativePositionAttention(
-            bottleneck_dim, num_heads, 2 * num_columns - 1
-        )
-        self.periodic_attention = RelativePositionAttention(
-            bottleneck_dim, num_heads, num_rows
-        )
+        if interaction_mode != "axis_mean":
+            self.temporal_attention = RelativePositionAttention(
+                bottleneck_dim, num_heads, 2 * num_columns - 1
+            )
+            self.periodic_attention = RelativePositionAttention(
+                bottleneck_dim, num_heads, num_rows
+            )
+        else:
+            self.temporal_attention = None
+            self.periodic_attention = None
         self.output_norm = nn.LayerNorm(bottleneck_dim)
         self.up = nn.Linear(bottleneck_dim, embed_dim)
         nn.init.xavier_uniform_(self.up.weight)
         nn.init.zeros_(self.up.bias)
         columns = torch.arange(num_columns)
         rows = torch.arange(num_rows)
+        if interaction_mode == "global_attention":
+            columns = columns.repeat(num_rows)
+            rows = rows.repeat_interleave(num_columns)
         self.register_buffer(
             "temporal_bias_index",
             columns[:, None] - columns[None, :] + num_columns - 1,
@@ -354,22 +375,24 @@ class TemporalPeriodicAdapter(nn.Module):
             (rows[:, None] - rows[None, :]) % num_rows,
         )
 
-    @staticmethod
-    def rms(x):
-        return x.detach().float().square().mean().sqrt()
-
-    @staticmethod
-    def pair_cosine(x):
-        x = F.normalize(x.detach().float(), dim=-1, eps=1e-12)
-        count = x.shape[-2]
-        if count == 1:
-            return x.new_tensor(1.0)
-        summed = x.sum(dim=-2)
-        diagonal = x.square().sum(dim=-1).sum(dim=-1)
-        return (
-            (summed.square().sum(dim=-1) - diagonal)
-            / (count * (count - 1))
-        ).mean()
+    # Existing TP diagnostic helpers are intentionally disabled and retained
+    # as comments.
+    # @staticmethod
+    # def rms(x):
+    #     return x.detach().float().square().mean().sqrt()
+    #
+    # @staticmethod
+    # def pair_cosine(x):
+    #     x = F.normalize(x.detach().float(), dim=-1, eps=1e-12)
+    #     count = x.shape[-2]
+    #     if count == 1:
+    #         return x.new_tensor(1.0)
+    #     summed = x.sum(dim=-2)
+    #     diagonal = x.square().sum(dim=-1).sum(dim=-1)
+    #     return (
+    #         (summed.square().sum(dim=-1) - diagonal)
+    #         / (count * (count - 1))
+    #     ).mean()
 
     def forward(self, patch_tokens, residual_gate, collect_statistics=False):
         batch_size, num_variables, num_patches, embed_dim = patch_tokens.shape
@@ -379,59 +402,88 @@ class TemporalPeriodicAdapter(nn.Module):
             batch_size, num_variables, self.num_rows,
             self.num_columns, embed_dim
         )
-        centered = grid - grid.mean(dim=(2, 3), keepdim=True)
+        centered = (
+            grid - grid.mean(dim=(2, 3), keepdim=True)
+            if self.center else grid
+        )
         hidden = self.down(self.center_norm(centered))
-        temporal = hidden.reshape(
-            batch_size, num_variables, self.num_rows,
-            self.num_columns, hidden.shape[-1]
-        )
-        temporal_update, temporal_statistics = self.temporal_attention(
-            temporal, self.temporal_bias_index, collect_statistics
-        )
-        temporal = temporal + temporal_update
-        periodic = temporal.permute(0, 1, 3, 2, 4)
-        periodic_update, periodic_statistics = self.periodic_attention(
-            periodic, self.periodic_bias_index, collect_statistics
-        )
-        periodic = periodic + periodic_update
-        hidden = periodic.permute(0, 1, 3, 2, 4)
+        if self.interaction_mode == "axis_attention":
+            temporal = hidden.reshape(
+                batch_size, num_variables, self.num_rows,
+                self.num_columns, hidden.shape[-1]
+            )
+            temporal_update, temporal_statistics = self.temporal_attention(
+                temporal, self.temporal_bias_index, collect_statistics
+            )
+            temporal = temporal + temporal_update
+            periodic = temporal.permute(0, 1, 3, 2, 4)
+            periodic_update, periodic_statistics = self.periodic_attention(
+                periodic, self.periodic_bias_index, collect_statistics
+            )
+            periodic = periodic + periodic_update
+            hidden = periodic.permute(0, 1, 3, 2, 4)
+        elif self.interaction_mode == "global_attention":
+            flattened = hidden.reshape(
+                batch_size, num_variables,
+                self.num_rows * self.num_columns, hidden.shape[-1]
+            )
+            temporal_update, temporal_statistics = self.temporal_attention(
+                flattened, self.temporal_bias_index, collect_statistics
+            )
+            flattened = flattened + temporal_update
+            periodic_update, periodic_statistics = self.periodic_attention(
+                flattened, self.periodic_bias_index, collect_statistics
+            )
+            hidden = (flattened + periodic_update).reshape_as(hidden)
+        else:
+            # Parameter-free Temporal-axis then Periodic-axis mean pooling.
+            hidden = hidden + hidden.mean(dim=3, keepdim=True)
+            hidden = hidden + hidden.mean(dim=2, keepdim=True)
+            temporal_statistics = periodic_statistics = None
         raw_correction = self.up(self.output_norm(hidden))
         applied_correction = residual_gate * raw_correction
         output = grid + applied_correction
-        if not collect_statistics:
-            return output.reshape_as(patch_tokens), None
-        with torch.no_grad():
-            reference_rms = self.rms(grid)
-            raw_patch_cosine = self.pair_cosine(
-                grid.reshape(batch_size, num_variables, num_patches, embed_dim)
-            )
-            statistics = {
-                "raw_patch_cosine": raw_patch_cosine,
-                "centered_residual_ratio": self.rms(centered)
-                / (reference_rms + 1e-12),
-                "centered_patch_cosine": self.pair_cosine(
-                    centered.reshape(
-                        batch_size, num_variables, num_patches, embed_dim
-                    )
-                ),
-                "temporal_entropy": temporal_statistics[0],
-                "temporal_mass": temporal_statistics[1],
-                "periodic_entropy": periodic_statistics[0],
-                "periodic_mass": periodic_statistics[1],
-                "raw_correction_ratio": self.rms(raw_correction)
-                / (reference_rms + 1e-12),
-                "beta": residual_gate.detach().float(),
-                "applied_correction_ratio": self.rms(applied_correction)
-                / (reference_rms + 1e-12),
-                "update_patch_cosine": F.cosine_similarity(
-                    grid.detach().float(), applied_correction.detach().float(),
-                    dim=-1, eps=1e-12
-                ).mean(),
-                "before_adapter_cosine": raw_patch_cosine,
-                "after_adapter_cosine": self.pair_cosine(
-                    output.reshape(
-                        batch_size, num_variables, num_patches, embed_dim
-                    )
-                ),
-            }
-        return output.reshape_as(patch_tokens), statistics
+        return output.reshape_as(patch_tokens), None
+
+        # Existing TP diagnostics are intentionally disabled and retained as
+        # comments.
+        # if not collect_statistics:
+        #     return output.reshape_as(patch_tokens), None
+        # with torch.no_grad():
+        #     reference_rms = self.rms(grid)
+        #     raw_patch_cosine = self.pair_cosine(
+        #         grid.reshape(
+        #             batch_size, num_variables, num_patches, embed_dim
+        #         )
+        #     )
+        #     statistics = {
+        #         "raw_patch_cosine": raw_patch_cosine,
+        #         "centered_residual_ratio": self.rms(centered)
+        #         / (reference_rms + 1e-12),
+        #         "centered_patch_cosine": self.pair_cosine(
+        #             centered.reshape(
+        #                 batch_size, num_variables, num_patches, embed_dim
+        #             )
+        #         ),
+        #         "temporal_entropy": temporal_statistics[0],
+        #         "temporal_mass": temporal_statistics[1],
+        #         "periodic_entropy": periodic_statistics[0],
+        #         "periodic_mass": periodic_statistics[1],
+        #         "raw_correction_ratio": self.rms(raw_correction)
+        #         / (reference_rms + 1e-12),
+        #         "beta": residual_gate.detach().float(),
+        #         "applied_correction_ratio": self.rms(applied_correction)
+        #         / (reference_rms + 1e-12),
+        #         "update_patch_cosine": F.cosine_similarity(
+        #             grid.detach().float(),
+        #             applied_correction.detach().float(),
+        #             dim=-1, eps=1e-12
+        #         ).mean(),
+        #         "before_adapter_cosine": raw_patch_cosine,
+        #         "after_adapter_cosine": self.pair_cosine(
+        #             output.reshape(
+        #                 batch_size, num_variables, num_patches, embed_dim
+        #             )
+        #         ),
+        #     }
+        # return output.reshape_as(patch_tokens), statistics

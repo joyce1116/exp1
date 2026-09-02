@@ -1,12 +1,12 @@
 # 导入 pandas，用于推断时间索引的采样频率。
-import hashlib
-import json
-import os
+# import hashlib  # Disabled summary diagnostics.
+# import json  # Disabled summary diagnostics.
+# import os  # Disabled summary diagnostics.
 
-import numpy as np
+# import numpy as np  # Disabled summary diagnostics.
 import pandas as pd
 import torch
-from pathlib import Path
+# from pathlib import Path  # Disabled summary diagnostics.
 from torch.utils.data import DataLoader
 
 # 导入 TFB 深度预测模型基类，复用通用训练与预测流程。
@@ -17,7 +17,7 @@ from ts_benchmark.baselines.utils import (
     forecasting_data_provider,
     train_val_split,
 )
-from ts_benchmark.data.data_pool import DataPool
+# from ts_benchmark.data.data_pool import DataPool  # Disabled summary diagnostics.
 from ts_benchmark.utils.get_device import get_device
 
 # 导入 VisionTS 的核心模型实现。
@@ -39,6 +39,7 @@ MODEL_HYPER_PARAMS = {
     "latent_dim": 192,  # 设置 latent embedding 的维度。
     "adapter_num_heads": 4,  # 设置 adapter 的 attention head 数量。
     "channel_depth": 1,
+    "ablation_mode": "full",
     "use_variable_chunk": False,  # 是否启用固定 16-variable 的低显存分块流程。
     "fp64": False,  # 默认不使用 float64 计算。
     "batch_size": 32,  # 设置默认训练 batch size。
@@ -54,29 +55,30 @@ class VisionTS(DeepForecastingModelBase):
     # 接收外部覆盖参数，并交由基类合并默认配置。
     def __init__(self, **kwargs):
         super(VisionTS, self).__init__(MODEL_HYPER_PARAMS, **kwargs)
-        parent_pid = os.getppid()
-        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        parent_stat = Path(f"/proc/{parent_pid}/stat").read_text()
-        parent_start = parent_stat[parent_stat.rfind(")") + 2:].split()[19]
-        excluded = {"horizon", "pred_len", "output_chunk_length"}
-        group_config = {
-            key: value for key, value in vars(self.config).items()
-            if key not in excluded
-        }
-        fingerprint = json.dumps(
-            [boot_id, parent_pid, parent_start, group_config],
-            sort_keys=True, default=str
-        )
-        self._run_id = hashlib.sha256(fingerprint.encode()).hexdigest()[:32]
-        self._summary_dir = None
-        self._collect_channel_statistics = False
-        self._channel_statistics_horizon = None
-        self._channel_statistics_sum = None
-        self._channel_statistics_count = None
-        self._channel_statistics_batch_active = False
-        self._validation_epoch = 0
-        self._best_validation_mse = float("inf")
-        self._best_relative_biases = None
+        # Existing summary/diagnostic state is intentionally disabled.
+        # parent_pid = os.getppid()
+        # boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        # parent_stat = Path(f"/proc/{parent_pid}/stat").read_text()
+        # parent_start = parent_stat[parent_stat.rfind(")") + 2:].split()[19]
+        # excluded = {"horizon", "pred_len", "output_chunk_length"}
+        # group_config = {
+        #     key: value for key, value in vars(self.config).items()
+        #     if key not in excluded
+        # }
+        # fingerprint = json.dumps(
+        #     [boot_id, parent_pid, parent_start, group_config],
+        #     sort_keys=True, default=str
+        # )
+        # self._run_id = hashlib.sha256(fingerprint.encode()).hexdigest()[:32]
+        # self._summary_dir = None
+        # self._collect_channel_statistics = False
+        # self._channel_statistics_horizon = None
+        # self._channel_statistics_sum = None
+        # self._channel_statistics_count = None
+        # self._channel_statistics_batch_active = False
+        # self._validation_epoch = 0
+        # self._best_validation_mse = float("inf")
+        # self._best_relative_biases = None
         self._series_dim = None
 
     # 将模型名称暴露给 TFB 的注册与记录流程。
@@ -91,19 +93,26 @@ class VisionTS(DeepForecastingModelBase):
             parameter for parameter in self.model.parameters()
             if parameter.requires_grad and parameter is not gate
         ]
-        optimizer = torch.optim.Adam([
-            {
+        if gate is None:
+            optimizer = torch.optim.Adam([{
                 "params": adapter_parameters,
                 "lr": self.config.lr,
                 "parameter_group": "adapters",
-            },
-            {
-                "params": [gate],
-                "lr": 10 * self.config.lr,
-                "weight_decay": 0.0,
-                "parameter_group": "gate",
-            },
-        ])
+            }])
+        else:
+            optimizer = torch.optim.Adam([
+                {
+                    "params": adapter_parameters,
+                    "lr": self.config.lr,
+                    "parameter_group": "adapters",
+                },
+                {
+                    "params": [gate],
+                    "lr": 10 * self.config.lr,
+                    "weight_decay": 0.0,
+                    "parameter_group": "gate",
+                },
+            ])
         return torch.nn.MSELoss(), optimizer
 
     def _adjust_lr(self, optimizer, epoch, config):
@@ -130,6 +139,7 @@ class VisionTS(DeepForecastingModelBase):
             latent_dim=self.config.latent_dim,  # 传入 latent embedding 维度。
             adapter_num_heads=self.config.adapter_num_heads,  # 传入 attention head 数量。
             channel_depth=self.config.channel_depth,
+            ablation_mode=self.config.ablation_mode,
         )
         # 补充与当前预测任务相关、需要在运行时确定的配置。
         model.update_config(
@@ -201,31 +211,34 @@ class VisionTS(DeepForecastingModelBase):
         # 再从当前训练集确定频率相关配置。
         self._set_data_frequency(train_data)
 
-    @staticmethod
-    def _dataset_name(train_valid_data, covariates):
-        identity_data = train_valid_data
-        exog_data = (covariates or {}).get("exog")
-        if exog_data is not None:
-            identity_data = pd.concat([identity_data, exog_data], axis=1)
-        data_pool = DataPool().get_pool()
-        dataset = getattr(data_pool, "_global_dataset", None)
-        data_dict = dataset.get_state()["data_dict"] if dataset is not None else {}
-        if len(data_dict) == 1:
-            return Path(next(iter(data_dict))).stem
-        matches = []
-        for name, data in data_dict.items():
-            if len(data) < len(identity_data):
-                continue
-            if not set(identity_data.columns).issubset(data.columns):
-                continue
-            candidate = data.iloc[:len(identity_data)].loc[
-                :, identity_data.columns
-            ]
-            if candidate.equals(identity_data):
-                matches.append(name)
-        if len(matches) == 1:
-            return Path(matches[0]).stem
-        return "unknown_dataset"
+    # Existing summary dataset identification is intentionally disabled.
+    # @staticmethod
+    # def _dataset_name(train_valid_data, covariates):
+    #     identity_data = train_valid_data
+    #     exog_data = (covariates or {}).get("exog")
+    #     if exog_data is not None:
+    #         identity_data = pd.concat([identity_data, exog_data], axis=1)
+    #     data_pool = DataPool().get_pool()
+    #     dataset = getattr(data_pool, "_global_dataset", None)
+    #     data_dict = (
+    #         dataset.get_state()["data_dict"] if dataset is not None else {}
+    #     )
+    #     if len(data_dict) == 1:
+    #         return Path(next(iter(data_dict))).stem
+    #     matches = []
+    #     for name, data in data_dict.items():
+    #         if len(data) < len(identity_data):
+    #             continue
+    #         if not set(identity_data.columns).issubset(data.columns):
+    #             continue
+    #         candidate = data.iloc[:len(identity_data)].loc[
+    #             :, identity_data.columns
+    #         ]
+    #         if candidate.equals(identity_data):
+    #             matches.append(name)
+    #     if len(matches) == 1:
+    #         return Path(matches[0]).stem
+    #     return "unknown_dataset"
 
     def forecast_fit(
         self,
@@ -236,20 +249,21 @@ class VisionTS(DeepForecastingModelBase):
         **kwargs,
     ):
         self._series_dim = train_valid_data.shape[-1]
-        self._validation_epoch = 0
-        self._best_validation_mse = float("inf")
-        self._best_relative_biases = None
-        dataset_name = self._dataset_name(train_valid_data, covariates)
-        self._summary_dir = (
-            Path("result")
-            / "Temp"
-            / "summary"
-            / dataset_name
-            / (
-                f"seqlen{self.config.seq_len}_lr{format(self.config.lr, '.12g')}_"
-                f"runid{self._run_id}"
-            )
-        )
+        # Existing summary/diagnostic output is intentionally disabled.
+        # self._validation_epoch = 0
+        # self._best_validation_mse = float("inf")
+        # self._best_relative_biases = None
+        # dataset_name = self._dataset_name(train_valid_data, covariates)
+        # self._summary_dir = (
+        #     Path("result")
+        #     / "Temp"
+        #     / "summary"
+        #     / dataset_name
+        #     / (
+        #         f"seqlen{self.config.seq_len}_lr{format(self.config.lr, '.12g')}_"
+        #         f"runid{self._run_id}"
+        #     )
+        # )
         if self.config.use_variable_chunk:
             result = self._forecast_fit_variable_chunks(
                 train_valid_data,
@@ -263,65 +277,67 @@ class VisionTS(DeepForecastingModelBase):
                 train_ratio_in_tv=train_ratio_in_tv,
                 **kwargs,
             )
-        self._save_best_relative_biases()
+        # self._save_best_relative_biases()
         return result
 
-    @staticmethod
-    def _scalar(value):
-        if torch.is_tensor(value):
-            return value.detach().float().mean().cpu().item()
-        return float(value)
-
-    def _save_validation_statistics(self, row):
-        if self._summary_dir is None:
-            return
-        self._summary_dir.mkdir(parents=True, exist_ok=True)
-        path = self._summary_dir / (
-            f"horizon{self.config.horizon}_stage3_internal_statistics.csv"
-        )
-        pd.DataFrame([row]).to_csv(
-            path, mode="a", header=not path.exists(), index=False,
-            float_format="%.8g"
-        )
-
-    def _capture_best_relative_biases(self, validation_mse):
-        if validation_mse >= self._best_validation_mse:
-            return
-        self._best_validation_mse = validation_mse
-        self._best_relative_biases = tuple(
-            (
-                adapter.temporal_attention.relative_bias.detach().cpu().clone(),
-                adapter.periodic_attention.relative_bias.detach().cpu().clone(),
-            )
-            for adapter in self._core_model().temporal_periodic_adapters
-        )
-
-    def _save_best_relative_biases(self):
-        if self._summary_dir is None or self._best_relative_biases is None:
-            return
-        self._summary_dir.mkdir(parents=True, exist_ok=True)
-        temporal_offsets = range(
-            -self._core_model().num_patch_input + 1,
-            self._core_model().num_patch_input,
-        )
-        for stage, (temporal, periodic) in zip(
-            ("early", "middle", "deep"), self._best_relative_biases
-        ):
-            pd.DataFrame(
-                temporal.numpy(),
-                columns=[str(offset) for offset in temporal_offsets],
-            ).to_csv(
-                self._summary_dir / f"temporal_relative_bias_{stage}.csv",
-                index=False,
-                float_format="%.8g",
-            )
-            pd.DataFrame(
-                periodic.numpy(), columns=[str(offset) for offset in range(14)]
-            ).to_csv(
-                self._summary_dir / f"periodic_relative_bias_{stage}.csv",
-                index=False,
-                float_format="%.8g",
-            )
+    # Existing validation diagnostics and summary CSV writers are
+    # intentionally disabled and retained as comments.
+    # @staticmethod
+    # def _scalar(value):
+    #     if torch.is_tensor(value):
+    #         return value.detach().float().mean().cpu().item()
+    #     return float(value)
+    #
+    # def _save_validation_statistics(self, row):
+    #     if self._summary_dir is None:
+    #         return
+    #     self._summary_dir.mkdir(parents=True, exist_ok=True)
+    #     path = self._summary_dir / (
+    #         f"horizon{self.config.horizon}_stage3_internal_statistics.csv"
+    #     )
+    #     pd.DataFrame([row]).to_csv(
+    #         path, mode="a", header=not path.exists(), index=False,
+    #         float_format="%.8g"
+    #     )
+    #
+    # def _capture_best_relative_biases(self, validation_mse):
+    #     if validation_mse >= self._best_validation_mse:
+    #         return
+    #     self._best_validation_mse = validation_mse
+    #     self._best_relative_biases = tuple(
+    #         (
+    #             adapter.temporal_attention.relative_bias.detach().cpu().clone(),
+    #             adapter.periodic_attention.relative_bias.detach().cpu().clone(),
+    #         )
+    #         for adapter in self._core_model().temporal_periodic_adapters
+    #     )
+    #
+    # def _save_best_relative_biases(self):
+    #     if self._summary_dir is None or self._best_relative_biases is None:
+    #         return
+    #     self._summary_dir.mkdir(parents=True, exist_ok=True)
+    #     temporal_offsets = range(
+    #         -self._core_model().num_patch_input + 1,
+    #         self._core_model().num_patch_input,
+    #     )
+    #     for stage, (temporal, periodic) in zip(
+    #         ("early", "middle", "deep"), self._best_relative_biases
+    #     ):
+    #         pd.DataFrame(
+    #             temporal.numpy(),
+    #             columns=[str(offset) for offset in temporal_offsets],
+    #         ).to_csv(
+    #             self._summary_dir / f"temporal_relative_bias_{stage}.csv",
+    #             index=False,
+    #             float_format="%.8g",
+    #         )
+    #         pd.DataFrame(
+    #             periodic.numpy(), columns=[str(offset) for offset in range(14)]
+    #         ).to_csv(
+    #             self._summary_dir / f"periodic_relative_bias_{stage}.csv",
+    #             index=False,
+    #             float_format="%.8g",
+    #         )
 
     def validate(self, valid_data_loader, series_dim, criterion):
         config = self.config
@@ -332,91 +348,110 @@ class VisionTS(DeepForecastingModelBase):
             num_workers=config.num_workers,
             drop_last=False,
         )
-        self._validation_epoch += 1
         self.model.eval()
         device = get_device()
-        square_sums = {
-            "channel": 0.0,
-            "tp": 0.0,
-            "fused": 0.0,
-            "disagreement": 0.0,
-        }
+        final_square_sum = 0.0
         value_count = 0
-        error_dot = 0.0
-        channel_error_square = 0.0
-        tp_error_square = 0.0
-        diagnostics = None
         with torch.no_grad():
-            for batch_index, (
-                input, target, input_mark, target_mark
-            ) in enumerate(valid_data_loader):
+            for input, target, input_mark, target_mark in valid_data_loader:
                 input, target = input.to(device), target.to(device)
-                result = self.model(
+                output = self.model(
                     input,
                     fp64=config.fp64,
                     use_variable_chunk=config.use_variable_chunk,
-                    return_branches=True,
-                    return_diagnostics=batch_index == 0,
                 )
-                if batch_index == 0:
-                    diagnostics = {
-                        key: self._scalar(value)
-                        for key, value in result["diagnostics"].items()
-                    }
                 target = target[:, -config.horizon:, :series_dim]
-                predictions = {
-                    name: result[name][:, -config.horizon:, :series_dim]
-                    for name in ("channel", "tp", "output")
-                }
-                channel, target_processed = self._post_process(
-                    predictions["channel"], target
-                )
-                tp, _ = self._post_process(predictions["tp"], target)
-                fused, _ = self._post_process(predictions["output"], target)
-                channel_error = (channel - target_processed).double()
-                tp_error = (tp - target_processed).double()
-                fused_error = (fused - target_processed).double()
-                square_sums["channel"] += channel_error.square().sum().item()
-                square_sums["tp"] += tp_error.square().sum().item()
-                square_sums["fused"] += fused_error.square().sum().item()
-                disagreement = (
-                    result["channel_normalized"][:, :, :series_dim]
-                    - result["tp_normalized"][:, :, :series_dim]
-                ).double()
-                square_sums["disagreement"] += (
-                    disagreement.square().sum().item()
-                )
-                value_count += fused_error.numel()
-                error_dot += (channel_error * tp_error).sum().item()
-                channel_error_square += channel_error.square().sum().item()
-                tp_error_square += tp_error.square().sum().item()
-        val_mse_channel = square_sums["channel"] / value_count
-        val_mse_tp = square_sums["tp"] / value_count
-        val_mse_fused = square_sums["fused"] / value_count
-        branch_error_cosine = error_dot / (
-            np.sqrt(channel_error_square * tp_error_square) + 1e-12
-        )
-        row = {
-            "epoch": self._validation_epoch,
-            "val_mse_channel": val_mse_channel,
-            "val_mse_tp": val_mse_tp,
-            "val_mse_fused": val_mse_fused,
-            "fusion_gate_g": self._scalar(
-                torch.sigmoid(self._core_model().fusion_logit)
-            ),
-            "prediction_disagreement_rms": np.sqrt(
-                square_sums["disagreement"] / value_count
-            ),
-            "branch_error_cosine": branch_error_cosine,
-            "fusion_gain_over_best_branch": (
-                min(val_mse_channel, val_mse_tp) - val_mse_fused
-            ),
-            **(diagnostics or {}),
-        }
-        self._save_validation_statistics(row)
-        self._capture_best_relative_biases(val_mse_fused)
+                output = output[:, -config.horizon:, :series_dim]
+                output, target = self._post_process(output, target)
+                final_error = (output - target).double()
+                final_square_sum += final_error.square().sum().item()
+                value_count += final_error.numel()
+        val_mse_final = final_square_sum / value_count
         self.model.train()
-        return val_mse_fused
+        return val_mse_final
+
+        # Existing validation diagnostics are intentionally disabled and kept
+        # below for reference. Early stopping above still monitors the exact
+        # full-validation MSE of the mode's final prediction.
+        # self._validation_epoch += 1
+        # square_sums = {
+        #     "channel": 0.0,
+        #     "tp": 0.0,
+        #     "fused": 0.0,
+        #     "disagreement": 0.0,
+        # }
+        # error_dot = 0.0
+        # channel_error_square = 0.0
+        # tp_error_square = 0.0
+        # diagnostics = None
+        # for batch_index, (
+        #     input, target, input_mark, target_mark
+        # ) in enumerate(valid_data_loader):
+        #     input, target = input.to(device), target.to(device)
+        #     result = self.model(
+        #         input,
+        #         fp64=config.fp64,
+        #         use_variable_chunk=config.use_variable_chunk,
+        #         return_branches=True,
+        #         return_diagnostics=batch_index == 0,
+        #     )
+        #     if batch_index == 0:
+        #         diagnostics = {
+        #             key: self._scalar(value)
+        #             for key, value in result["diagnostics"].items()
+        #         }
+        #     target = target[:, -config.horizon:, :series_dim]
+        #     predictions = {
+        #         name: result[name][:, -config.horizon:, :series_dim]
+        #         for name in ("channel", "tp", "output")
+        #     }
+        #     channel, target_processed = self._post_process(
+        #         predictions["channel"], target
+        #     )
+        #     tp, _ = self._post_process(predictions["tp"], target)
+        #     fused, _ = self._post_process(predictions["output"], target)
+        #     channel_error = (channel - target_processed).double()
+        #     tp_error = (tp - target_processed).double()
+        #     fused_error = (fused - target_processed).double()
+        #     square_sums["channel"] += channel_error.square().sum().item()
+        #     square_sums["tp"] += tp_error.square().sum().item()
+        #     square_sums["fused"] += fused_error.square().sum().item()
+        #     disagreement = (
+        #         result["channel_normalized"][:, :, :series_dim]
+        #         - result["tp_normalized"][:, :, :series_dim]
+        #     ).double()
+        #     square_sums["disagreement"] += (
+        #         disagreement.square().sum().item()
+        #     )
+        #     value_count += fused_error.numel()
+        #     error_dot += (channel_error * tp_error).sum().item()
+        #     channel_error_square += channel_error.square().sum().item()
+        #     tp_error_square += tp_error.square().sum().item()
+        # val_mse_channel = square_sums["channel"] / value_count
+        # val_mse_tp = square_sums["tp"] / value_count
+        # val_mse_fused = square_sums["fused"] / value_count
+        # branch_error_cosine = error_dot / (
+        #     np.sqrt(channel_error_square * tp_error_square) + 1e-12
+        # )
+        # row = {
+        #     "epoch": self._validation_epoch,
+        #     "val_mse_channel": val_mse_channel,
+        #     "val_mse_tp": val_mse_tp,
+        #     "val_mse_fused": val_mse_fused,
+        #     "fusion_gate_g": self._scalar(
+        #         torch.sigmoid(self._core_model().fusion_logit)
+        #     ),
+        #     "prediction_disagreement_rms": np.sqrt(
+        #         square_sums["disagreement"] / value_count
+        #     ),
+        #     "branch_error_cosine": branch_error_cosine,
+        #     "fusion_gain_over_best_branch": (
+        #         min(val_mse_channel, val_mse_tp) - val_mse_fused
+        #     ),
+        #     **(diagnostics or {}),
+        # }
+        # self._save_validation_statistics(row)
+        # self._capture_best_relative_biases(val_mse_fused)
 
     def _backward_variable_chunks(
         self, input, target, series_dim, criterion, scaler=None
@@ -426,7 +461,11 @@ class VisionTS(DeepForecastingModelBase):
             input, fp64=self.config.fp64
         )
         correction = context["correction"]
-        correction_leaf = correction.detach().requires_grad_(True)
+        correction_leaf = (
+            correction.detach().requires_grad_(True)
+            if correction is not None else None
+        )
+        dual_branch = model.use_channel and model.use_tp
         for start in range(
             0, context["num_variables"], model.variable_chunk_size
         ):
@@ -445,41 +484,56 @@ class VisionTS(DeepForecastingModelBase):
                 start,
                 end,
                 correction=correction_leaf,
-                return_branches=True,
+                return_branches=dual_branch,
             )
-            channel = result["channel"][
-                :, -self.config.horizon:, :supervised_width
-            ]
-            tp = result["tp"][
-                :, -self.config.horizon:, :supervised_width
-            ]
             chunk_target = target[
                 :, -self.config.horizon:, start:supervised_end
             ]
-            channel, processed_target = self._post_process(
-                channel, chunk_target
-            )
-            tp, _ = self._post_process(
-                tp, chunk_target
-            )
-            gate = torch.sigmoid(model.fusion_logit)
-            gate_prediction = (
-                gate * channel.detach() + (1 - gate) * tp.detach()
-            )
-            weighted_loss = (
-                criterion(channel, processed_target)
-                + criterion(tp, processed_target)
-                + criterion(gate_prediction, processed_target)
-            ) * (
-                supervised_width / series_dim
-            )
+            if dual_branch:
+                channel = result["channel"][
+                    :, -self.config.horizon:, :supervised_width
+                ]
+                tp = result["tp"][
+                    :, -self.config.horizon:, :supervised_width
+                ]
+                channel, processed_target = self._post_process(
+                    channel, chunk_target
+                )
+                tp, _ = self._post_process(
+                    tp, chunk_target
+                )
+                gate = torch.sigmoid(model.fusion_logit)
+                gate_prediction = (
+                    gate * channel.detach() + (1 - gate) * tp.detach()
+                )
+                weighted_loss = (
+                    criterion(channel, processed_target)
+                    + criterion(tp, processed_target)
+                    + criterion(gate_prediction, processed_target)
+                ) * (
+                    supervised_width / series_dim
+                )
+            else:
+                prediction = result[
+                    :, -self.config.horizon:, :supervised_width
+                ]
+                prediction, processed_target = self._post_process(
+                    prediction, chunk_target
+                )
+                weighted_loss = criterion(
+                    prediction, processed_target
+                ) * (supervised_width / series_dim)
             if scaler is None:
                 weighted_loss.backward()
             else:
                 scaler.scale(weighted_loss).backward()
 
         # 各块已把梯度累积到小 correction leaf；这里只回传一次完整 Global 图。
-        if correction_leaf.grad is not None and correction.requires_grad:
+        if (
+            correction_leaf is not None
+            and correction_leaf.grad is not None
+            and correction.requires_grad
+        ):
             correction.backward(correction_leaf.grad)
 
     def _forecast_fit_variable_chunks(
@@ -605,103 +659,113 @@ class VisionTS(DeepForecastingModelBase):
     def _core_model(self):
         return getattr(self.model, "module", self.model)
 
-    def _reset_channel_statistics(self, horizon):
-        shape = (self.config.channel_depth, 11)
-        self._channel_statistics_horizon = horizon
-        self._channel_statistics_sum = torch.zeros(shape, dtype=torch.float64)
-        self._channel_statistics_count = torch.zeros(
-            shape, dtype=torch.float64
-        )
-
-    def _accumulate_channel_statistics(self, statistics):
-        statistics = statistics.detach().cpu().to(torch.float64).reshape(
-            -1, self.config.channel_depth, 11
-        )
-        valid = torch.isfinite(statistics)
-        self._channel_statistics_sum.add_(
-            torch.where(valid, statistics, 0).sum(dim=0)
-        )
-        self._channel_statistics_count.add_(valid.sum(dim=0))
-
-    def _channel_statistics_frame(self):
-        count = self._channel_statistics_count
-        values = self._channel_statistics_sum / count.clamp_min(1)
-        values[count == 0] = float("nan")
-        return pd.DataFrame({
-            "horizon": self._channel_statistics_horizon,
-            "round": range(1, self.config.channel_depth + 1),
-            "intra_channel_update_ratio": values[:, 0].numpy(),
-            "intra_patch_update_ratio": values[:, 1].numpy(),
-            "inter_channel_update_ratio": values[:, 2].numpy(),
-            "channel_pair_cosine_before_inter": values[:, 3].numpy(),
-            "channel_pair_cosine": values[:, 4].numpy(),
-            "within_variable_patch_cosine_before_intra": values[:, 5].numpy(),
-            "within_variable_patch_cosine": values[:, 6].numpy(),
-            "between_variable_patch_cosine_before_intra": values[:, 7].numpy(),
-            "between_variable_patch_cosine": values[:, 8].numpy(),
-            "correction_rms": values[:, 9].numpy(),
-            "correction_to_patch_rms_ratio": values[:, 10].numpy(),
-        })
-
-    def _save_channel_statistics(self):
-        if self._summary_dir is None or self._channel_statistics_sum is None:
-            return
-        self._summary_dir.mkdir(parents=True, exist_ok=True)
-        frame = self._channel_statistics_frame()
-        prefix = f"horizon{self._channel_statistics_horizon}_channel_module"
-        frame.to_csv(
-            self._summary_dir / f"{prefix}.csv", index=False,
-            float_format="%.8g"
-        )
-
-    def forecast(self, horizon, series, *, covariates=None):
-        self._reset_channel_statistics(horizon)
-        self._collect_channel_statistics = True
-        try:
-            result = super().forecast(
-                horizon, series, covariates=covariates
-            )
-        finally:
-            self._collect_channel_statistics = False
-        self._save_channel_statistics()
-        return result
-
-    def batch_forecast(self, horizon, batch_maker, **kwargs):
-        new_collection = (
-            not self._channel_statistics_batch_active
-            or self._channel_statistics_horizon != horizon
-        )
-        if new_collection:
-            self._reset_channel_statistics(horizon)
-            self._channel_statistics_batch_active = True
-        self._collect_channel_statistics = True
-        try:
-            result = super().batch_forecast(horizon, batch_maker, **kwargs)
-        finally:
-            self._collect_channel_statistics = False
-        has_more_batches = getattr(batch_maker, "has_more_batches", None)
-        if has_more_batches is None or not has_more_batches():
-            self._save_channel_statistics()
-            self._channel_statistics_batch_active = False
-        return result
+    # Existing channel-statistics collection and summary CSV output are
+    # intentionally disabled. With these overrides commented, forecast and
+    # batch_forecast use the unchanged TFB base implementations.
+    # def _reset_channel_statistics(self, horizon):
+    #     shape = (self.config.channel_depth, 11)
+    #     self._channel_statistics_horizon = horizon
+    #     self._channel_statistics_sum = torch.zeros(shape, dtype=torch.float64)
+    #     self._channel_statistics_count = torch.zeros(
+    #         shape, dtype=torch.float64
+    #     )
+    #
+    # def _accumulate_channel_statistics(self, statistics):
+    #     statistics = statistics.detach().cpu().to(torch.float64).reshape(
+    #         -1, self.config.channel_depth, 11
+    #     )
+    #     valid = torch.isfinite(statistics)
+    #     self._channel_statistics_sum.add_(
+    #         torch.where(valid, statistics, 0).sum(dim=0)
+    #     )
+    #     self._channel_statistics_count.add_(valid.sum(dim=0))
+    #
+    # def _channel_statistics_frame(self):
+    #     count = self._channel_statistics_count
+    #     values = self._channel_statistics_sum / count.clamp_min(1)
+    #     values[count == 0] = float("nan")
+    #     return pd.DataFrame({
+    #         "horizon": self._channel_statistics_horizon,
+    #         "round": range(1, self.config.channel_depth + 1),
+    #         "intra_channel_update_ratio": values[:, 0].numpy(),
+    #         "intra_patch_update_ratio": values[:, 1].numpy(),
+    #         "inter_channel_update_ratio": values[:, 2].numpy(),
+    #         "channel_pair_cosine_before_inter": values[:, 3].numpy(),
+    #         "channel_pair_cosine": values[:, 4].numpy(),
+    #         "within_variable_patch_cosine_before_intra": values[:, 5].numpy(),
+    #         "within_variable_patch_cosine": values[:, 6].numpy(),
+    #         "between_variable_patch_cosine_before_intra": values[:, 7].numpy(),
+    #         "between_variable_patch_cosine": values[:, 8].numpy(),
+    #         "correction_rms": values[:, 9].numpy(),
+    #         "correction_to_patch_rms_ratio": values[:, 10].numpy(),
+    #     })
+    #
+    # def _save_channel_statistics(self):
+    #     if self._summary_dir is None or self._channel_statistics_sum is None:
+    #         return
+    #     self._summary_dir.mkdir(parents=True, exist_ok=True)
+    #     frame = self._channel_statistics_frame()
+    #     prefix = f"horizon{self._channel_statistics_horizon}_channel_module"
+    #     frame.to_csv(
+    #         self._summary_dir / f"{prefix}.csv", index=False,
+    #         float_format="%.8g"
+    #     )
+    #
+    # def forecast(self, horizon, series, *, covariates=None):
+    #     self._reset_channel_statistics(horizon)
+    #     self._collect_channel_statistics = True
+    #     try:
+    #         result = super().forecast(
+    #             horizon, series, covariates=covariates
+    #         )
+    #     finally:
+    #         self._collect_channel_statistics = False
+    #     self._save_channel_statistics()
+    #     return result
+    #
+    # def batch_forecast(self, horizon, batch_maker, **kwargs):
+    #     new_collection = (
+    #         not self._channel_statistics_batch_active
+    #         or self._channel_statistics_horizon != horizon
+    #     )
+    #     if new_collection:
+    #         self._reset_channel_statistics(horizon)
+    #         self._channel_statistics_batch_active = True
+    #     self._collect_channel_statistics = True
+    #     try:
+    #         result = super().batch_forecast(horizon, batch_maker, **kwargs)
+    #     finally:
+    #         self._collect_channel_statistics = False
+    #     has_more_batches = getattr(batch_maker, "has_more_batches", None)
+    #     if has_more_batches is None or not has_more_batches():
+    #         self._save_channel_statistics()
+    #         self._channel_statistics_batch_active = False
+    #     return result
 
     # 执行一次 forward，并按 TFB 约定封装预测结果。
     # shape 约定：B 为 batch size，S 为 seq_len，H 为 horizon，V 为变量数，M 为时间特征数。
     # 输入 shape：input [B, S, V]，target [B, label_len+H, V]。
     # mark shape：input_mark [B, S, M]，target_mark [B, label_len+H, M]。
     def _process(self, input, target, input_mark, target_mark):
-        separate_losses = self.model.training and torch.is_grad_enabled()
+        core_model = self._core_model()
+        separate_losses = (
+            core_model.use_channel
+            and core_model.use_tp
+            and self.model.training
+            and torch.is_grad_enabled()
+        )
         result = self.model(
             input,
             fp64=self.config.fp64,
             use_variable_chunk=self.config.use_variable_chunk,
-            return_statistics=self._collect_channel_statistics,
+            # return_statistics=self._collect_channel_statistics,
             return_branches=separate_losses,
         )
-        if self._collect_channel_statistics:
-            output, statistics = result
-            self._accumulate_channel_statistics(statistics)
-            return {"output": output}
+        # Existing channel statistics are intentionally disabled.
+        # if self._collect_channel_statistics:
+        #     output, statistics = result
+        #     self._accumulate_channel_statistics(statistics)
+        #     return {"output": output}
         if not separate_losses:
             return {"output": result}
         target = target[
@@ -713,7 +777,7 @@ class VisionTS(DeepForecastingModelBase):
         tp, _ = self._post_process(
             result["tp"][:, :, :self._series_dim], target
         )
-        gate = torch.sigmoid(self._core_model().fusion_logit)
+        gate = torch.sigmoid(core_model.fusion_logit)
         gate_prediction = gate * channel.detach() + (1 - gate) * tp.detach()
         tp_loss = torch.mean((tp - processed_target) ** 2)
         gate_loss = torch.mean((gate_prediction - processed_target) ** 2)

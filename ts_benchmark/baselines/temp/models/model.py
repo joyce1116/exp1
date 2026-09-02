@@ -34,6 +34,16 @@ MAE_ARCH = {
     "mae_huge": [models_mae.mae_vit_huge_patch14, "mae_visualize_vit_huge.pth"]
 }
 
+ABLATION_MODES = {
+    "full",
+    "wo_channel",
+    "wo_tp",
+    "wo_centering",
+    "shared_tp",
+    "wo_tp_factorization",
+    "tp_mean_pooling",
+}
+
 
 # 定义使用视觉 MAE backbone 与跨变量 adapter 进行时间序列预测的主模型。
 class VisionTS(nn.Module):
@@ -44,7 +54,7 @@ class VisionTS(nn.Module):
     # 初始化视觉 backbone、pretrained checkpoint 和 channel-token adapter。
     def __init__(self, arch='mae_base', ckpt_path=None, load_ckpt=True,
                  num_latents=1, latent_dim=192, adapter_num_heads=4,
-                 channel_depth=1):
+                 channel_depth=1, ablation_mode="full"):
         # 调用 nn.Module 的初始化逻辑。
         super(VisionTS, self).__init__()
 
@@ -55,6 +65,22 @@ class VisionTS(nn.Module):
         if not isinstance(channel_depth, int) or isinstance(channel_depth, bool) \
                 or channel_depth < 1:
             raise ValueError("channel_depth must be a positive integer.")
+        if ablation_mode not in ABLATION_MODES:
+            raise ValueError(
+                f"Unknown ablation_mode: {ablation_mode}. "
+                f"Should be in {sorted(ABLATION_MODES)}"
+            )
+        self.ablation_mode = ablation_mode
+        self.use_channel = ablation_mode != "wo_channel"
+        self.use_tp = ablation_mode != "wo_tp"
+        self.use_centering = ablation_mode != "wo_centering"
+        self.share_tp = ablation_mode == "shared_tp"
+        if ablation_mode == "wo_tp_factorization":
+            self.tp_interaction_mode = "global_attention"
+        elif ablation_mode == "tp_mean_pooling":
+            self.tp_interaction_mode = "axis_mean"
+        else:
+            self.tp_interaction_mode = "axis_attention"
 
         # 调用对应构建函数创建 MAE 视觉 backbone。
         self.vision_model = MAE_ARCH[arch][0]()
@@ -84,18 +110,24 @@ class VisionTS(nn.Module):
             param.requires_grad = False
 
         # 创建 channel-token adapter。
-        self.variable_adapter = VariableAwareLatentAdapter(
-            # 使 adapter 输入维度与 MAE positional embedding 维度一致。
-            embed_dim=self.vision_model.pos_embed.shape[-1],
-            # 设置每个变量的 channel token 数量。
-            num_latents=num_latents,
-            # 设置每个 latent 的特征维度。
-            latent_dim=latent_dim,
-            # 设置 adapter 的 attention head 数。
-            num_heads=adapter_num_heads,
-            channel_depth=channel_depth,
-        )
-        self.fusion_logit = nn.Parameter(torch.zeros(()))
+        if self.use_channel:
+            self.variable_adapter = VariableAwareLatentAdapter(
+                # 使 adapter 输入维度与 MAE positional embedding 维度一致。
+                embed_dim=self.vision_model.pos_embed.shape[-1],
+                # 设置每个变量的 channel token 数量。
+                num_latents=num_latents,
+                # 设置每个 latent 的特征维度。
+                latent_dim=latent_dim,
+                # 设置 adapter 的 attention head 数。
+                num_heads=adapter_num_heads,
+                channel_depth=channel_depth,
+            )
+        else:
+            self.variable_adapter = None
+        if self.use_channel and self.use_tp:
+            self.fusion_logit = nn.Parameter(torch.zeros(()))
+        else:
+            self.fusion_logit = None
     # 根据序列长度和周期更新图像化、对齐与 mask 配置。
     def update_config(self, context_len, pred_len, periodicity=1, norm_const=0.4, align_const=0.4, interpolation='bilinear'):
         # 读取 MAE 期望的方形图像边长。
@@ -166,19 +198,42 @@ class VisionTS(nn.Module):
         self.register_buffer("mask", mask.float().reshape((1, -1)))
         # 记录 mask 中待重建 patch 所占的比例。
         self.mask_ratio = torch.mean(mask).item()
-        if self.num_patch != 14 or len(self.vision_model.blocks) != 12:
+        if self.use_tp and (
+            self.num_patch != 14 or len(self.vision_model.blocks) != 12
+        ):
             raise ValueError("Temporal-periodic branch requires mae_base geometry.")
-        self.temporal_periodic_adapters = nn.ModuleList([
-            TemporalPeriodicAdapter(
+        if self.use_tp and self.share_tp:
+            self.tp_shared = TemporalPeriodicAdapter(
                 embed_dim=self.vision_model.pos_embed.shape[-1],
                 bottleneck_dim=64,
                 num_heads=4,
                 num_rows=14,
                 num_columns=self.num_patch_input,
+                center=self.use_centering,
+                interaction_mode=self.tp_interaction_mode,
             )
-            for _ in range(3)
-        ])
-        self.tp_residual_logits = nn.Parameter(torch.full((12,), -2.944))
+            self.temporal_periodic_adapters = None
+        elif self.use_tp:
+            self.temporal_periodic_adapters = nn.ModuleList([
+                TemporalPeriodicAdapter(
+                    embed_dim=self.vision_model.pos_embed.shape[-1],
+                    bottleneck_dim=64,
+                    num_heads=4,
+                    num_rows=14,
+                    num_columns=self.num_patch_input,
+                    center=self.use_centering,
+                    interaction_mode=self.tp_interaction_mode,
+                )
+                for _ in range(3)
+            ])
+            self.tp_shared = None
+        else:
+            self.temporal_periodic_adapters = None
+            self.tp_shared = None
+        if self.use_tp:
+            self.tp_residual_logits = nn.Parameter(torch.full((12,), -2.944))
+        else:
+            self.tp_residual_logits = None
 
     def _normalize_series(self, x, fp64=False):
         means = x.mean(1, keepdim=True).detach()
@@ -243,71 +298,82 @@ class VisionTS(nn.Module):
         visible = self._visible_patch_chunk(x_enc, noise)
         patch_memory = self.variable_adapter.project_patch_memory(visible)
         for channel_tokens in channel_history:
-            patch_input = patch_memory
+            # patch_input = patch_memory  # Disabled channel diagnostics.
             patch_memory, channel_tokens = (
                 self.variable_adapter.update_variable_tokens(
                     patch_memory, channel_tokens
                 )
             )
-        if self.variable_adapter.collect_statistics:
-            with torch.no_grad():
-                normalized_patch_input = F.normalize(
-                    patch_input.detach().float(), dim=-1, eps=1e-12
-                )
-                normalized_patch_output = F.normalize(
-                    patch_memory.detach().float(), dim=-1, eps=1e-12
-                )
-                num_patches = normalized_patch_output.shape[2]
-                patch_input_sum = normalized_patch_input.sum(dim=2)
-                patch_output_sum = normalized_patch_output.sum(dim=2)
-                return (
-                    channel_tokens,
-                    patch_memory.detach().float().sub(
-                        patch_input.detach().float()
-                    ).square().sum(),
-                    patch_input.detach().float().square().sum(),
-                    patch_memory.detach().float().square().sum(),
-                    visible.detach().float().square().sum(),
-                    visible.new_tensor(visible.numel(), dtype=torch.float32),
-                    (
-                        patch_input_sum.square().sum(dim=-1) - num_patches
-                    ).sum(),
-                    (
-                        patch_output_sum.square().sum(dim=-1) - num_patches
-                    ).sum(),
-                    visible.new_tensor(
-                        normalized_patch_output.shape[0]
-                        * normalized_patch_output.shape[1]
-                        * num_patches * (num_patches - 1),
-                        dtype=torch.float32
-                    ),
-                    normalized_patch_input.sum(dim=1),
-                    normalized_patch_output.sum(dim=1),
-                )
+        # Existing channel diagnostic calculations are intentionally disabled.
+        # if self.variable_adapter.collect_statistics:
+        #     with torch.no_grad():
+        #         normalized_patch_input = F.normalize(
+        #             patch_input.detach().float(), dim=-1, eps=1e-12
+        #         )
+        #         normalized_patch_output = F.normalize(
+        #             patch_memory.detach().float(), dim=-1, eps=1e-12
+        #         )
+        #         num_patches = normalized_patch_output.shape[2]
+        #         patch_input_sum = normalized_patch_input.sum(dim=2)
+        #         patch_output_sum = normalized_patch_output.sum(dim=2)
+        #         return (
+        #             channel_tokens,
+        #             patch_memory.detach().float().sub(
+        #                 patch_input.detach().float()
+        #             ).square().sum(),
+        #             patch_input.detach().float().square().sum(),
+        #             patch_memory.detach().float().square().sum(),
+        #             visible.detach().float().square().sum(),
+        #             visible.new_tensor(visible.numel(), dtype=torch.float32),
+        #             (
+        #                 patch_input_sum.square().sum(dim=-1) - num_patches
+        #             ).sum(),
+        #             (
+        #                 patch_output_sum.square().sum(dim=-1) - num_patches
+        #             ).sum(),
+        #             visible.new_tensor(
+        #                 normalized_patch_output.shape[0]
+        #                 * normalized_patch_output.shape[1]
+        #                 * num_patches * (num_patches - 1),
+        #                 dtype=torch.float32
+        #             ),
+        #             normalized_patch_input.sum(dim=1),
+        #             normalized_patch_output.sum(dim=1),
+        #         )
         return channel_tokens
 
     def prepare_variable_chunk_context(self, x, fp64=False):
         x_enc, means, stdev = self._normalize_series(x, fp64=fp64)
         num_variables = x_enc.shape[1]
         noise = self._shared_mask_noise()
+        if not self.use_channel:
+            return {
+                "x_enc": x_enc,
+                "means": means,
+                "stdev": stdev,
+                "noise": noise,
+                "grid_permutations": self._visible_grid_permutations(noise),
+                "correction": None,
+                "num_variables": num_variables,
+            }
         channel_history = [
             self.variable_adapter.initial_channel_tokens(
                 x_enc.shape[0], num_variables
             )
         ]
-        statistics = []
+        # statistics = []  # Disabled channel diagnostics.
         for _ in range(self.variable_adapter.channel_depth):
             token_chunks = []
-            patch_delta_square = 0
-            patch_input_square = 0
-            patch_output_square = 0
-            reference_square = 0
-            reference_count = 0
-            within_patch_input_cosine_sum = 0
-            within_patch_output_cosine_sum = 0
-            within_patch_cosine_count = 0
-            between_patch_input_token_sum = None
-            between_patch_output_token_sum = None
+            # patch_delta_square = 0
+            # patch_input_square = 0
+            # patch_output_square = 0
+            # reference_square = 0
+            # reference_count = 0
+            # within_patch_input_cosine_sum = 0
+            # within_patch_output_cosine_sum = 0
+            # within_patch_cosine_count = 0
+            # between_patch_input_token_sum = None
+            # between_patch_output_token_sum = None
             for start in range(0, num_variables, self.variable_chunk_size):
                 end = min(start + self.variable_chunk_size, num_variables)
                 variable_chunk = x_enc[:, start:end, :]
@@ -327,94 +393,97 @@ class VisionTS(nn.Module):
                     token_chunk = self._channel_token_chunk(
                         variable_chunk, noise, *history_chunk
                     )
-                if self.variable_adapter.collect_statistics:
-                    (
-                        token_chunk, patch_delta, patch_input, patch_output,
-                        visible_square, visible_count, within_patch_input_sum,
-                        within_patch_output_sum, within_patch_count,
-                        between_patch_input_sum, between_patch_output_sum
-                    ) = token_chunk
-                    patch_delta_square = patch_delta_square + patch_delta
-                    patch_input_square = patch_input_square + patch_input
-                    patch_output_square = patch_output_square + patch_output
-                    reference_square = reference_square + visible_square
-                    reference_count = reference_count + visible_count
-                    within_patch_input_cosine_sum = (
-                        within_patch_input_cosine_sum
-                        + within_patch_input_sum
-                    )
-                    within_patch_output_cosine_sum = (
-                        within_patch_output_cosine_sum
-                        + within_patch_output_sum
-                    )
-                    within_patch_cosine_count = (
-                        within_patch_cosine_count + within_patch_count
-                    )
-                    between_patch_input_token_sum = (
-                        between_patch_input_sum
-                        if between_patch_input_token_sum is None
-                        else between_patch_input_token_sum
-                        + between_patch_input_sum
-                    )
-                    between_patch_output_token_sum = (
-                        between_patch_output_sum
-                        if between_patch_output_token_sum is None
-                        else between_patch_output_token_sum
-                        + between_patch_output_sum
-                    )
+                # Existing per-chunk channel diagnostics are disabled.
+                # if self.variable_adapter.collect_statistics:
+                #     (
+                #         token_chunk, patch_delta, patch_input, patch_output,
+                #         visible_square, visible_count, within_patch_input_sum,
+                #         within_patch_output_sum, within_patch_count,
+                #         between_patch_input_sum, between_patch_output_sum
+                #     ) = token_chunk
+                #     patch_delta_square = patch_delta_square + patch_delta
+                #     patch_input_square = patch_input_square + patch_input
+                #     patch_output_square = patch_output_square + patch_output
+                #     reference_square = reference_square + visible_square
+                #     reference_count = reference_count + visible_count
+                #     within_patch_input_cosine_sum = (
+                #         within_patch_input_cosine_sum
+                #         + within_patch_input_sum
+                #     )
+                #     within_patch_output_cosine_sum = (
+                #         within_patch_output_cosine_sum
+                #         + within_patch_output_sum
+                #     )
+                #     within_patch_cosine_count = (
+                #         within_patch_cosine_count + within_patch_count
+                #     )
+                #     between_patch_input_token_sum = (
+                #         between_patch_input_sum
+                #         if between_patch_input_token_sum is None
+                #         else between_patch_input_token_sum
+                #         + between_patch_input_sum
+                #     )
+                #     between_patch_output_token_sum = (
+                #         between_patch_output_sum
+                #         if between_patch_output_token_sum is None
+                #         else between_patch_output_token_sum
+                #         + between_patch_output_sum
+                #     )
                 token_chunks.append(token_chunk)
             channel_local = torch.cat(token_chunks, dim=1)
             channel_tokens = self.variable_adapter.mix_channel_tokens(
                 channel_local
             )
-            if self.variable_adapter.collect_statistics:
-                statistics.append(
-                    self.variable_adapter.round_statistics(
-                        channel_history[-1], channel_local, channel_tokens,
-                        patch_ratio=(
-                            patch_delta_square.sqrt()
-                            / (
-                                torch.maximum(
-                                    patch_input_square.sqrt(),
-                                    patch_output_square.sqrt()
-                                ) + 1e-12
-                            )
-                        ),
-                        patch_input_cosines=(
-                            torch.where(
-                                within_patch_cosine_count > 0,
-                                within_patch_input_cosine_sum
-                                / within_patch_cosine_count.clamp_min(1),
-                                within_patch_input_cosine_sum.new_tensor(1.0)
-                            ),
-                            self.variable_adapter.pair_cosine_from_sum(
-                                between_patch_input_token_sum, num_variables
-                            ),
-                        ),
-                        patch_output_cosines=(
-                            torch.where(
-                                within_patch_cosine_count > 0,
-                                within_patch_output_cosine_sum
-                                / within_patch_cosine_count.clamp_min(1),
-                                within_patch_output_cosine_sum.new_tensor(1.0)
-                            ),
-                            self.variable_adapter.pair_cosine_from_sum(
-                                between_patch_output_token_sum, num_variables
-                            ),
-                        )
-                    )
-                )
+            # Existing per-round channel diagnostics are disabled.
+            # if self.variable_adapter.collect_statistics:
+            #     statistics.append(
+            #         self.variable_adapter.round_statistics(
+            #             channel_history[-1], channel_local, channel_tokens,
+            #             patch_ratio=(
+            #                 patch_delta_square.sqrt()
+            #                 / (
+            #                     torch.maximum(
+            #                         patch_input_square.sqrt(),
+            #                         patch_output_square.sqrt()
+            #                     ) + 1e-12
+            #                 )
+            #             ),
+            #             patch_input_cosines=(
+            #                 torch.where(
+            #                     within_patch_cosine_count > 0,
+            #                     within_patch_input_cosine_sum
+            #                     / within_patch_cosine_count.clamp_min(1),
+            #                     within_patch_input_cosine_sum.new_tensor(1.0)
+            #                 ),
+            #                 self.variable_adapter.pair_cosine_from_sum(
+            #                     between_patch_input_token_sum, num_variables
+            #                 ),
+            #             ),
+            #             patch_output_cosines=(
+            #                 torch.where(
+            #                     within_patch_cosine_count > 0,
+            #                     within_patch_output_cosine_sum
+            #                     / within_patch_cosine_count.clamp_min(1),
+            #                     within_patch_output_cosine_sum.new_tensor(1.0)
+            #                 ),
+            #                 self.variable_adapter.pair_cosine_from_sum(
+            #                     between_patch_output_token_sum, num_variables
+            #                 ),
+            #             )
+            #         )
+            #     )
             channel_history.append(channel_tokens)
         correction = self.variable_adapter.shared_correction(channel_tokens)
-        if self.variable_adapter.collect_statistics:
-            self.variable_adapter.latest_statistics = (
-                self.variable_adapter.complete_statistics(
-                    statistics, correction,
-                    reference_rms=(
-                        reference_square / reference_count
-                    ).sqrt()
-                )
-            )
+        # Existing completed channel diagnostics are disabled.
+        # if self.variable_adapter.collect_statistics:
+        #     self.variable_adapter.latest_statistics = (
+        #         self.variable_adapter.complete_statistics(
+        #             statistics, correction,
+        #             reference_rms=(
+        #                 reference_square / reference_count
+        #             ).sqrt()
+        #         )
+        #     )
         return {
             "x_enc": x_enc,
             "means": means,
@@ -437,39 +506,50 @@ class VisionTS(nn.Module):
         self, visible, grid_permutations, correction=None,
         collect_diagnostics=False
     ):
-        if correction is None:
-            channel_patches, correction = self.variable_adapter(
-                visible, return_correction=True
-            )
-        else:
-            channel_patches = self.variable_adapter.apply_correction(
-                visible, correction
-            )
-        channel_latent = self._sequence_with_cls(channel_patches)
-        for block in self.vision_model.blocks:
-            channel_latent = block(channel_latent)
-        channel_latent = self.vision_model.norm(channel_latent)
+        channel_latent = None
+        if self.use_channel:
+            if correction is None:
+                channel_patches, correction = self.variable_adapter(
+                    visible, return_correction=True
+                )
+            else:
+                channel_patches = self.variable_adapter.apply_correction(
+                    visible, correction
+                )
+            channel_latent = self._sequence_with_cls(channel_patches)
+            for block in self.vision_model.blocks:
+                channel_latent = block(channel_latent)
+            channel_latent = self.vision_model.norm(channel_latent)
 
-        tp_latent = self._sequence_with_cls(visible)
+        tp_latent = None
         tp_statistics = []
-        to_grid, from_grid = grid_permutations
-        for layer, block in enumerate(self.vision_model.blocks):
-            tp_latent = block(tp_latent)
-            patches = tp_latent[:, 1:].reshape_as(visible)
-            grid_patches = patches.index_select(2, to_grid)
-            grid_patches, statistics = self.temporal_periodic_adapters[layer // 4](
-                grid_patches,
-                torch.sigmoid(self.tp_residual_logits[layer]),
-                collect_diagnostics,
-            )
-            if collect_diagnostics:
-                tp_statistics.append(statistics)
-            patches = grid_patches.index_select(2, from_grid)
-            tp_latent = torch.cat((
-                tp_latent[:, :1],
-                patches.reshape(tp_latent.shape[0], patches.shape[2], patches.shape[3]),
-            ), dim=1)
-        tp_latent = self.vision_model.norm(tp_latent)
+        if self.use_tp:
+            tp_latent = self._sequence_with_cls(visible)
+            to_grid, from_grid = grid_permutations
+            for layer, block in enumerate(self.vision_model.blocks):
+                tp_latent = block(tp_latent)
+                patches = tp_latent[:, 1:].reshape_as(visible)
+                grid_patches = patches.index_select(2, to_grid)
+                adapter = (
+                    self.tp_shared if self.share_tp
+                    else self.temporal_periodic_adapters[layer // 4]
+                )
+                grid_patches, statistics = adapter(
+                    grid_patches,
+                    torch.sigmoid(self.tp_residual_logits[layer]),
+                    False,
+                )
+                # Existing TP diagnostics are intentionally disabled.
+                # if collect_diagnostics:
+                #     tp_statistics.append(statistics)
+                patches = grid_patches.index_select(2, from_grid)
+                tp_latent = torch.cat((
+                    tp_latent[:, :1],
+                    patches.reshape(
+                        tp_latent.shape[0], patches.shape[2], patches.shape[3]
+                    ),
+                ), dim=1)
+            tp_latent = self.vision_model.norm(tp_latent)
         return channel_latent, tp_latent, correction, tp_statistics
 
     def _decode_normalized(
@@ -493,41 +573,43 @@ class VisionTS(nn.Module):
             return normalized, image
         return normalized
 
-    def _channel_diagnostics(self, correction):
-        statistics = self.variable_adapter.latest_statistics
-        result = {}
-        for round_index in range(self.variable_adapter.channel_depth):
-            result[f"channel_q_pre_inter_cos_r{round_index + 1}"] = (
-                statistics[round_index, 3]
-            )
-            result[f"channel_q_post_inter_cos_r{round_index + 1}"] = (
-                statistics[round_index, 4]
-            )
-        result["channel_correction_ratio"] = statistics[-1, 10]
-        result["channel_correction_crossvar_cosine"] = (
-            self.variable_adapter.pair_cosine(correction.squeeze(2))
-        )
-        return result
-
-    def _format_tp_diagnostics(self, tp_statistics):
-        result = {}
-        for layer, statistics in enumerate(tp_statistics, 1):
-            prefix = f"tp_block_{layer}"
-            for name in (
-                "raw_patch_cosine", "centered_residual_ratio",
-                "centered_patch_cosine", "temporal_entropy",
-                "periodic_entropy", "raw_correction_ratio", "beta",
-                "applied_correction_ratio", "update_patch_cosine",
-                "before_adapter_cosine", "after_adapter_cosine",
-            ):
-                result[f"{prefix}_{name}"] = statistics[name]
-            for index, value in enumerate(statistics["temporal_mass"]):
-                offset = index - self.num_patch_input + 1
-                label = "0" if offset == 0 else f"{offset:+d}"
-                result[f"{prefix}_temporal_mass_offset_{label}"] = value
-            for offset, value in enumerate(statistics["periodic_mass"]):
-                result[f"{prefix}_periodic_mass_offset_{offset}"] = value
-        return result
+    # Existing channel/TP diagnostic formatters are intentionally disabled
+    # and retained as comments.
+    # def _channel_diagnostics(self, correction):
+    #     statistics = self.variable_adapter.latest_statistics
+    #     result = {}
+    #     for round_index in range(self.variable_adapter.channel_depth):
+    #         result[f"channel_q_pre_inter_cos_r{round_index + 1}"] = (
+    #             statistics[round_index, 3]
+    #         )
+    #         result[f"channel_q_post_inter_cos_r{round_index + 1}"] = (
+    #             statistics[round_index, 4]
+    #         )
+    #     result["channel_correction_ratio"] = statistics[-1, 10]
+    #     result["channel_correction_crossvar_cosine"] = (
+    #         self.variable_adapter.pair_cosine(correction.squeeze(2))
+    #     )
+    #     return result
+    #
+    # def _format_tp_diagnostics(self, tp_statistics):
+    #     result = {}
+    #     for layer, statistics in enumerate(tp_statistics, 1):
+    #         prefix = f"tp_block_{layer}"
+    #         for name in (
+    #             "raw_patch_cosine", "centered_residual_ratio",
+    #             "centered_patch_cosine", "temporal_entropy",
+    #             "periodic_entropy", "raw_correction_ratio", "beta",
+    #             "applied_correction_ratio", "update_patch_cosine",
+    #             "before_adapter_cosine", "after_adapter_cosine",
+    #         ):
+    #             result[f"{prefix}_{name}"] = statistics[name]
+    #         for index, value in enumerate(statistics["temporal_mass"]):
+    #             offset = index - self.num_patch_input + 1
+    #             label = "0" if offset == 0 else f"{offset:+d}"
+    #             result[f"{prefix}_temporal_mass_offset_{label}"] = value
+    #         for offset, value in enumerate(statistics["periodic_mass"]):
+    #             result[f"{prefix}_periodic_mass_offset_{offset}"] = value
+    #     return result
 
     def _forward_visible(
         self, visible, ids_restore, grid_permutations, means, stdev,
@@ -541,41 +623,72 @@ class VisionTS(nn.Module):
                 collect_diagnostics=collect_diagnostics
             )
         )
-        channel_decoded = self._decode_normalized(
-            channel_latent, ids_restore, batch_size, num_variables,
-            return_image=return_image
-        )
-        tp_decoded = self._decode_normalized(
-            tp_latent, ids_restore, batch_size, num_variables,
-            return_image=return_image
-        )
+        channel_decoded = None
+        if self.use_channel:
+            channel_decoded = self._decode_normalized(
+                channel_latent, ids_restore, batch_size, num_variables,
+                return_image=return_image
+            )
+        tp_decoded = None
+        if self.use_tp:
+            tp_decoded = self._decode_normalized(
+                tp_latent, ids_restore, batch_size, num_variables,
+                return_image=return_image
+            )
         if return_image:
-            channel_normalized, channel_image = channel_decoded
-            tp_normalized, tp_image = tp_decoded
+            if self.use_channel:
+                channel_normalized, channel_image = channel_decoded
+            if self.use_tp:
+                tp_normalized, tp_image = tp_decoded
         else:
-            channel_normalized = channel_decoded
-            tp_normalized = tp_decoded
-        gate = torch.sigmoid(self.fusion_logit)
-        fused_normalized = (
-            gate * channel_normalized + (1 - gate) * tp_normalized
-        )
+            if self.use_channel:
+                channel_normalized = channel_decoded
+            if self.use_tp:
+                tp_normalized = tp_decoded
+        if self.use_channel and self.use_tp:
+            gate = torch.sigmoid(self.fusion_logit)
+            final_normalized = (
+                gate * channel_normalized + (1 - gate) * tp_normalized
+            )
+            if return_image:
+                final_image = gate * channel_image + (1 - gate) * tp_image
+        elif self.use_channel:
+            final_normalized = channel_normalized
+            if return_image:
+                final_image = channel_image
+        else:
+            final_normalized = tp_normalized
+            if return_image:
+                final_image = tp_image
         result = {
-            "output": fused_normalized * stdev + means,
+            "output": final_normalized * stdev + means,
         }
         if return_branches:
-            result.update({
-                "channel": channel_normalized * stdev + means,
-                "tp": tp_normalized * stdev + means,
-                "channel_normalized": channel_normalized,
-                "tp_normalized": tp_normalized,
-            })
+            if self.use_channel and self.use_tp:
+                result.update({
+                    "channel": channel_normalized * stdev + means,
+                    "tp": tp_normalized * stdev + means,
+                    "channel_normalized": channel_normalized,
+                    "tp_normalized": tp_normalized,
+                })
+            elif self.use_channel:
+                result.update({
+                    "channel": channel_normalized * stdev + means,
+                    "channel_normalized": channel_normalized,
+                })
+            else:
+                result.update({
+                    "tp": tp_normalized * stdev + means,
+                    "tp_normalized": tp_normalized,
+                })
         if return_image:
-            result["image"] = gate * channel_image + (1 - gate) * tp_image
-        if collect_diagnostics:
-            result["diagnostics"] = {
-                **self._channel_diagnostics(correction),
-                **self._format_tp_diagnostics(tp_statistics),
-            }
+            result["image"] = final_image
+        # Existing diagnostic metrics are intentionally disabled.
+        # if collect_diagnostics:
+        #     result["diagnostics"] = {
+        #         **self._channel_diagnostics(correction),
+        #         **self._format_tp_diagnostics(tp_statistics),
+        #     }
         return result
 
     def forward_variable_chunk(
@@ -593,17 +706,20 @@ class VisionTS(nn.Module):
         visible = visible.reshape(
             batch_size, num_variables, visible.shape[1], visible.shape[2]
         )
-        if correction is None:
-            correction = context["correction"]
-        correction = correction[:, start:end]
+        if self.use_channel:
+            if correction is None:
+                correction = context["correction"]
+            correction = correction[:, start:end]
+        else:
+            correction = None
         result = self._forward_visible(
             visible, ids_restore, context["grid_permutations"],
             context["means"][:, :, start:end],
             context["stdev"][:, :, start:end],
             correction=correction,
-            collect_diagnostics=return_diagnostics,
+            collect_diagnostics=False,
             return_image=export_image,
-            return_branches=return_branches or return_diagnostics,
+            return_branches=return_branches,
         )
         if export_image:
             mask_image = self.vision_model.unpatchify(
@@ -622,7 +738,8 @@ class VisionTS(nn.Module):
             result["reconstructed_image"] = einops.rearrange(
                 reconstructed, '(b n) c h w -> b n h w c', b=batch_size
             )
-        if return_branches or return_diagnostics:
+        # or return_diagnostics  # Disabled diagnostic return path.
+        if return_branches:
             return result
         if export_image:
             return (
@@ -637,7 +754,7 @@ class VisionTS(nn.Module):
     ):
         context = self.prepare_variable_chunk_context(x, fp64=fp64)
         results = []
-        widths = []
+        # widths = []  # Disabled diagnostic aggregation.
         for start in range(
             0, context["num_variables"], self.variable_chunk_size
         ):
@@ -648,10 +765,11 @@ class VisionTS(nn.Module):
             results.append(self.forward_variable_chunk(
                 context, start, end, export_image=export_image,
                 return_branches=return_branches,
-                return_diagnostics=return_diagnostics,
+                return_diagnostics=False,
             ))
-            widths.append(end - start)
-        if not (return_branches or return_diagnostics):
+            # widths.append(end - start)
+        # or return_diagnostics  # Disabled diagnostic return path.
+        if not return_branches:
             if export_image:
                 return (
                     torch.cat([item[0] for item in results], dim=-1),
@@ -659,12 +777,13 @@ class VisionTS(nn.Module):
                     torch.cat([item[2] for item in results], dim=1),
                 )
             return torch.cat(results, dim=-1)
+        merged_names = (
+            "output", "channel", "tp", "channel_normalized",
+            "tp_normalized"
+        )
         merged = {
             name: torch.cat([item[name] for item in results], dim=-1)
-            for name in (
-                "output", "channel", "tp", "channel_normalized",
-                "tp_normalized"
-            )
+            for name in merged_names if name in results[0]
         }
         if export_image:
             merged["input_image"] = torch.cat(
@@ -673,40 +792,44 @@ class VisionTS(nn.Module):
             merged["reconstructed_image"] = torch.cat(
                 [item["reconstructed_image"] for item in results], dim=1
             )
-        if return_diagnostics:
-            diagnostics = self._channel_diagnostics(context["correction"])
-            tp_keys = [
-                key for key in results[0]["diagnostics"]
-                if key.startswith("tp_block_")
-            ]
-            total_width = sum(widths)
-            for key in tp_keys:
-                diagnostics[key] = sum(
-                    item["diagnostics"][key] * width
-                    for item, width in zip(results, widths)
-                ) / total_width
-            merged["diagnostics"] = diagnostics
+        # Existing diagnostic aggregation is intentionally disabled.
+        # if return_diagnostics:
+        #     diagnostics = self._channel_diagnostics(context["correction"])
+        #     tp_keys = [
+        #         key for key in results[0]["diagnostics"]
+        #         if key.startswith("tp_block_")
+        #     ]
+        #     total_width = sum(widths)
+        #     for key in tp_keys:
+        #         diagnostics[key] = sum(
+        #             item["diagnostics"][key] * width
+        #             for item, width in zip(results, widths)
+        #         ) / total_width
+        #     merged["diagnostics"] = diagnostics
         return merged
 
     def _attach_statistics(self, result, return_statistics):
-        if not return_statistics:
-            return result
-        return result, self.variable_adapter.latest_statistics.unsqueeze(0)
+        # Existing channel statistics are intentionally disabled.
+        # if not return_statistics:
+        #     return result
+        # return result, self.variable_adapter.latest_statistics.unsqueeze(0)
+        return result
 
     def forward(
         self, x, export_image=False, fp64=False, use_variable_chunk=False,
         return_statistics=False, return_branches=False,
         return_diagnostics=False
     ):
-        self.variable_adapter.collect_statistics = (
-            return_statistics or return_diagnostics
-        )
-        self.variable_adapter.latest_statistics = None
+        # Existing diagnostic collection is intentionally disabled.
+        # self.variable_adapter.collect_statistics = (
+        #     return_statistics or return_diagnostics
+        # )
+        # self.variable_adapter.latest_statistics = None
         if use_variable_chunk:
             result = self._forward_variable_chunks(
                 x, export_image=export_image, fp64=fp64,
                 return_branches=return_branches,
-                return_diagnostics=return_diagnostics,
+                return_diagnostics=False,
             )
             return self._attach_statistics(result, return_statistics)
         x_enc, means, stdev = self._normalize_series(x, fp64=fp64)
@@ -724,9 +847,9 @@ class VisionTS(nn.Module):
         result = self._forward_visible(
             visible, ids_restore, self._visible_grid_permutations(noise),
             means, stdev,
-            collect_diagnostics=return_diagnostics,
+            collect_diagnostics=False,
             return_image=export_image,
-            return_branches=return_branches or return_diagnostics,
+            return_branches=return_branches,
         )
         if export_image:
             mask_image = self.vision_model.unpatchify(
@@ -745,7 +868,8 @@ class VisionTS(nn.Module):
             result["reconstructed_image"] = einops.rearrange(
                 reconstructed, '(b n) c h w -> b n h w c', b=batch_size
             )
-        if return_branches or return_diagnostics:
+        # or return_diagnostics  # Disabled diagnostic return path.
+        if return_branches:
             return self._attach_statistics(result, return_statistics)
         if export_image:
             output = (
